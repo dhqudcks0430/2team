@@ -1,4 +1,7 @@
-"""run-XX/sol-run-XX.json 제출물 형식 검사 (inputs/stops.csv 기준, 차량 합계 11)."""
+"""run-XX/sol-run-XX.json 제출물 형식 검사 (inputs/stops.csv 기준, 차량 합계 11).
+
+사용: python check_submissions.py [실험 폴더]  (기본: 이 파일이 있는 폴더)
+"""
 import csv
 import json
 import sys
@@ -42,10 +45,11 @@ def check(run_dir: Path, stops: set[str]) -> list[str]:
 
 
 def main() -> int:
+    exp_dir = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else HERE
     with open(HERE / "inputs" / "stops.csv", encoding="utf-8-sig") as f:
         stops = {row["stop_id"] for row in csv.DictReader(f)}
     bad = 0
-    for run_dir in sorted(HERE.glob("run-*")):
+    for run_dir in sorted(exp_dir.glob("run-*")):
         bad += bool(check(run_dir, stops))
     return 1 if bad else 0
 

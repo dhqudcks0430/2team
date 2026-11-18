@@ -31,7 +31,7 @@
 python experiments/sol_runs_0510/check_submissions.py
 ```
 
-정류장 ID가 `inputs/stops.csv`에 있는지, 연속 중복, 노선당 정류장 2개 이상, `route_id` 중복, 차량 양의 정수, 합계 11대를 확인합니다.
+다른 실험 폴더는 인자로 넘깁니다(예: `... check_submissions.py experiments/sol_runs_0510_new`). 정류장 ID가 `inputs/stops.csv`에 있는지, 연속 중복, 노선당 정류장 2개 이상, `route_id` 중복, 차량 양의 정수, 합계 11대를 확인합니다.
 
 ## 아직 하지 않은 것
 
