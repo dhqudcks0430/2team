@@ -394,6 +394,7 @@ async function main() {
     if (results.some((r) => r.exp_walk)) S.assume = 'walk';   // 걷기·형평 실험 안이 있으면 그 가정으로 시작
     $('#noMaeul').checked = true; $('#noGg').checked = true; $('#configRow').hidden = false;
   }
+  if (meta.nets && !meta.nets.includes(S.net)) S.net = meta.nets[0];   // 그 구에 있는 망으로 시작(도로망만 있는 실험실)
   $('#muniLegend').hidden = !muni;
   $('#simDate').innerHTML = meta.dates_exp.map((d) => `<option value="${d}" ${d === meta.dates_exp[2] ? 'selected' : ''}>${d.slice(4, 6)}/${d.slice(6)}</option>`).join('');
   layersPanel();
