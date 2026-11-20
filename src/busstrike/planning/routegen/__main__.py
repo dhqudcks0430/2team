@@ -21,7 +21,8 @@
 - `--profile v1`: 순회형 끔, 필수 정류장 끔, 고정 한도(편도 20·30분, 정차 8) → 기존 v1과 바이트 단위로 같은 plan.json.
 - `--profile v2`(기본): **버스 통행 가능 도로망으로만**(`--network-dir`의 road.json·turns.json, 없으면 거절),
   순환 운행만(편도 노선은 배분 후보·결과에 없다), 필수 정류장 켬(`--facilities` 필요),
-  길이 규칙 N=2, 정차 상한 없음, 우회율 1.6(고리 전체 ÷ 2×폭), 닫는 공차 ≤ 300초, 길 건너 짝 100m.
+  길이 규칙 N=2, 정차 상한 없음, 순회형 우회율 ≤ 3.0(고리 전체 ÷ 2×폭; 출발점 편도는 1.6), 닫는 공차 ≤ 300초,
+  길 건너 짝 100m, 허브 최소 3개.
   v1은 기존 결과와 바이트 비교(회귀)용이다. v1 안은 편도 + 빈 차 복귀라 운행안으로 쓰지 않는다.
 
 v2 추가 출력
@@ -69,17 +70,21 @@ def _opt_int(text: str) -> int | None:
     return None if text.lower() in ("none", "inf", "0") else int(text)
 
 
+def _opt_float(text: str) -> float | None:
+    return None if text.lower() in ("none",) else float(text)
+
+
 UNSET = object()   # 프로필 값으로 채울 인자의 기본값(문자열이 아니어야 argparse가 type으로 바꾸지 않는다)
 
 # 프로필 기본값. UNSET인 인자만 프로필 값으로 채운다.
 PROFILES: dict[str, dict] = {
     "v1": {"loops": False, "must_stops": False, "length_n": None, "l_max": (20, 30), "max_stops": 8,
            "max_detour": 1.6, "endpoints": "all", "pair_radius_m": 50.0, "loop_detour": "direction",
-           "close_max_s": None, "hub_min_count": 0},
+           "close_max_s": None, "hub_min_count": 0, "loop_max_detour": None},
     # v2: 순환 운행만. 짝 100m·고리 전체 우회율은 지자체 셔틀안(2026-01, 25개 구) 모양을 근거로 정했다(설계 문서 7절).
     "v2": {"loops": True, "must_stops": True, "length_n": 2, "l_max": (20, 30), "max_stops": None,
            "max_detour": 1.6, "endpoints": "all", "pair_radius_m": 100.0, "loop_detour": "loop_total",
-           "close_max_s": 300, "hub_min_count": 3},
+           "close_max_s": 300, "hub_min_count": 3, "loop_max_detour": 3.0},
 }
 
 
@@ -138,8 +143,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="순회형 오는 쪽 우회율 상한(--loop-detour direction일 때만). 기본: --max-detour")
     ap.add_argument("--hub-min-count", type=int, default=UNSET,
                     help="허브 최소 개수(F_min 넘는 역이 적으면 수요 큰 역부터 채움). 기본: 프로필(v1 0, v2 3)")
-    ap.add_argument("--loop-max-detour", type=float, default=None,
-                    help="순회형 우회율 상한(망 경로 기준). 기본: --max-detour(1.6)")
+    ap.add_argument("--loop-max-detour", type=_opt_float, default=UNSET,
+                    help="순회형 우회율 상한(망 경로 기준). none = --max-detour. 기본: 프로필(v2 3.0 — 지자체 고리를 같은 "
+                         "도로망에서 잰 중앙값 2.87)")
     ap.add_argument("--loop-detour", choices=("direction", "loop_total"), default=UNSET,
                     help="순회형 우회율 재는 법. 기본: 프로필(v2 loop_total)")
     ap.add_argument("--close-max-s", type=_opt_int, default=UNSET,
@@ -158,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     prof = PROFILES[args.profile]
     for k in ("loops", "must_stops", "endpoints", "length_n", "l_max", "max_stops", "max_detour", "pair_radius_m",
-              "loop_detour", "close_max_s", "hub_min_count"):
+              "loop_detour", "close_max_s", "hub_min_count", "loop_max_detour"):
         if getattr(args, k) is UNSET:
             setattr(args, k, prof[k])
     if args.profile == "v2" and args.network_dir is None:
