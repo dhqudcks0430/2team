@@ -11,6 +11,10 @@
 4. 목표를 순서대로 망 최단경로로 잇는다. 이미 쓴 정류장(S2: 같은 ID 두 번 금지)을 지나는 목표는 건너뛴다.
 5. 짝을 못 찾거나 건너뛴 목표가 있으면 오는 쪽에 수요 정류장을 끼운다(증가 덮개 ÷ 증가 시간, 제약 안에서).
 6. 끝: 오는 쪽 정류장 중 첫 정류장까지 공차 복귀(망 최단경로)가 가장 짧은 곳에서 자른다(동률이면 뒤쪽).
+7. 고리 닫기: 그 공차가 상한(close_max_s)을 넘으면, 끝에서 기점까지 이미 쓴 정류장을 피하는 망 최단경로를 찾아
+   기점 직전 정류장까지를 영업 구간으로 잇는다. 그러면 빈 차로 가는 건 기점으로 들어가는 마지막 한 구간뿐이다.
+   망이 기존 버스 구간뿐이라 기점 건너편에서 기점으로 바로 돌아가는(U턴) 구간이 대개 없기 때문이다.
+   그래도 상한을 넘거나 제약(우회율·길이)을 깨면 만들지 않는다.
 
 승객은 기점(앵커)을 넘어 탈 수 없다(시뮬레이터 가정 A23: 영업 leg 하나 안에서 o 다음에 d). 덮개 계산
 (`generate.covered_keys`)이 이미 그 조건이라 근사에서도 기점을 넘는 수요는 세지 않는다.
@@ -169,6 +173,29 @@ class LoopMaker:
         return not loop_violations(self.g, stops, turn, self.max_detour, self.max_stops, self.length_s,
                                    self.return_detour, self.detour_mode)
 
+    def _close_path(self, seq: list[str]) -> tuple[str, ...] | None:
+        """seq 끝 → 기점(seq[0]) 망 최단경로, seq의 다른 정류장은 지나지 않는다(S2). 없으면 None."""
+        start, goal = seq[-1], seq[0]
+        banned = set(seq[1:-1])
+        import heapq
+        heap = [(0, (start,))]
+        done: set[str] = set()
+        while heap:
+            cost, path = heapq.heappop(heap)
+            here = path[-1]
+            if here in done:
+                continue
+            if here == goal:
+                return path
+            done.add(here)
+            for nxt in self.g.tt.successors(here):
+                if nxt in done or nxt in banned:
+                    continue
+                c = cost + self.g.weight(here, nxt)
+                if c <= self.length_s:
+                    heapq.heappush(heap, (c, path + (nxt,)))
+        return None
+
     def _deadhead(self, a: str, b: str) -> int | None:
         if a == b:
             return 0
@@ -264,12 +291,23 @@ class LoopMaker:
         if best is None:
             self.stats["failed"] += 1
             return None
-        if self.close_max_s is not None and best[0][0] > self.close_max_s:
-            self.stats["failed"] += 1
-            self.stats["failed_close"] += 1
-            return None                                # 닫는 공차가 길면 사실상 편도라 만들지 않는다
         j = best[1]
         stops = tuple(seq[: j + 1])
+        deadhead = best[0][0]
+        if self.close_max_s is not None and deadhead > self.close_max_s:
+            # 7. 공차 경로를 영업으로: 끝 → 기점 직전까지 이어 빈 차 구간을 마지막 한 구간으로 줄인다
+            cp = self._close_path(list(stops))
+            if cp is None or len(cp) < 3:
+                self.stats["failed"] += 1
+                self.stats["failed_close"] += 1
+                return None                            # 닫는 공차가 길면 사실상 편도라 만들지 않는다
+            stops = stops + cp[1:-1]
+            deadhead = self.g.weight(cp[-2], cp[-1])
+            if deadhead > self.close_max_s:
+                self.stats["failed"] += 1
+                self.stats["failed_close"] += 1
+                return None
+            self.stats["closed_in_service"] = self.stats.get("closed_in_service", 0) + 1
         if not self._ok(stops, turn):
             self.stats["failed"] += 1
             return None
@@ -281,4 +319,4 @@ class LoopMaker:
         self.stats["skipped"] += len(skipped) + len(missing)
         self.stats["inserted"] += len(inserted)
         return LoopBuild(stops, turn, len(targets), joined, sorted(set(skipped) | set(missing)), inserted,
-                         best[0][0])
+                         deadhead)

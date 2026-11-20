@@ -70,6 +70,7 @@ class Params:
     loop_detour: str = "direction"   # 순회형 우회율: direction(방향마다) | loop_total(고리 전체 ÷ 2×폭)
     close_max_s: int | None = None   # 순회형 닫는 공차(끝 → 기점) 상한(초). None = 없음
     loop_only: bool = False          # 결과 후보를 순회형만 남긴다(편도는 순회형을 만드는 출발점으로만 쓴다)
+    loop_max_detour: float | None = None   # 순회형 우회율 상한(None = max_detour). 망 경로로 재므로 지자체 고리도 크게 나온다
     loop_insert_top: int = 30        # 순회형 오는 쪽에 끼울 수요 정류장 후보 수(값 큰 순)
 
     @property
@@ -630,8 +631,9 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
 
     # v2-b. 순회형: 편도 후보마다(생성·피더·필수 전용) 순회형 버전
     loop_stats: dict = {}
+    loop_cap = p.max_detour if p.loop_max_detour is None else p.loop_max_detour
     if p.loops:
-        maker = LoopMaker(net, graph, b.od_total, p.max_detour, p.max_stops, L_max_s, p.pair_radius_m,
+        maker = LoopMaker(net, graph, b.od_total, loop_cap, p.max_stops, L_max_s, p.pair_radius_m,
                           p.loop_insert_top, p.return_detour, p.loop_detour, p.close_max_s)
         for key in sorted(raw, key=lambda k: (k[0], k[1], k[2], k[3])):
             c = raw[key]
@@ -664,7 +666,7 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
                 if got is not None:
                     new, nt = got
                     if c.shape == "loop":
-                        ok = not loop_violations(graph, new, nt, p.max_detour, p.max_stops, L_max_s, p.return_detour,
+                        ok = not loop_violations(graph, new, nt, loop_cap, p.max_stops, L_max_s, p.return_detour,
                                                  p.loop_detour)
                     else:
                         ok = not graph.violations(new, _station_stops(net, c.hubs), lim_ins)

@@ -116,6 +116,28 @@ class LoopTest(unittest.TestCase):
         self.assertIsNone(mk.build(("N1", "N2", "N3", "N4", "H")))
         self.assertEqual(mk.stats["failed_close"], 1)
 
+    def test_long_closing_deadhead_is_served_instead(self):
+        # S1 → N1 직접 연결이 없고 S1 → W → N1뿐: 공차 180초 > 상한 100초 → W까지 영업으로 잇고 W → N1만 빈 차
+        stops = {f"N{i}": _st(f"N{i}", f"P{i}", i) for i in range(1, 5)}
+        stops.update({f"S{i}": _st(f"S{i}", f"P{i}", i, -0.05) for i in range(1, 5)})
+        stops.update({"H": _st("H", "역앞", 5), "E": _st("E", "역건너", 5, -0.05), "W": _st("W", "서쪽", 0.5, -0.02)})
+        pairs = [("N1", "N2"), ("N2", "N3"), ("N3", "N4"), ("N4", "H"), ("H", "E"), ("E", "S4"), ("S4", "S3"),
+                 ("S3", "S2"), ("S2", "S1"), ("S1", "W"), ("W", "N1")]
+        tt = TravelTimeTable.from_dict({"schema_version": 1, "network_snapshot_id": "syn-1", "valid_from_s": 21600,
+                                        "valid_until_s": 43200, "segments": _segments(stops, pairs)})
+        net = Network(tt, stops, {"K": Station("K", "역", stops["H"].lat, stops["H"].lon + 0.0005, "H", "E")})
+        g = Graph(net, 10, 7200)
+        mk = LoopMaker(net, g, self.od, 3.0, None, 7020, close_max_s=100)
+        b = mk.build(("N1", "N2", "N3", "N4", "H"))
+        self.assertIsNotNone(b)
+        self.assertEqual(b.stops[-2:], ("S1", "W"))
+        self.assertEqual(b.deadhead_s, 90)
+        self.assertEqual(mk.stats["closed_in_service"], 1)
+        sc = scenario(2)
+        rep = check_plan(single_route_plan(b.stops, net.tt, sc), net.tt, sc)
+        self.assertTrue(rep["ok"], rep["failures"])
+        self.assertEqual(rep["routes"][0]["return_stops"], ["W", "N1"])
+
     def test_loop_total_detour(self):
         stops = ("N1", "N2", "N3", "N4", "H", "E", "S4", "S3", "S2", "S1")
         r = loop_detour(self.g, stops, 4, "loop_total")

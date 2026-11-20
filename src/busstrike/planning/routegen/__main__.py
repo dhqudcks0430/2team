@@ -134,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pair-radius-m", type=float, default=UNSET, help="길 건너 짝 거리(이름 같음). 기본: 프로필(v2 100)")
     ap.add_argument("--return-detour", type=float, default=None,
                     help="순회형 오는 쪽 우회율 상한(--loop-detour direction일 때만). 기본: --max-detour")
+    ap.add_argument("--loop-max-detour", type=float, default=None,
+                    help="순회형 우회율 상한(망 경로 기준). 기본: --max-detour(1.6)")
     ap.add_argument("--loop-detour", choices=("direction", "loop_total"), default=UNSET,
                     help="순회형 우회율 재는 법. 기본: 프로필(v2 loop_total)")
     ap.add_argument("--close-max-s", type=_opt_int, default=UNSET,
@@ -193,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
                       loops=args.loops, length_n=args.length_n, endpoints=args.endpoints, must_stops=must_list,
                       must_insert_radius_m=args.must_insert_radius_m, pair_radius_m=args.pair_radius_m,
                       return_detour=args.return_detour, loop_detour=args.loop_detour, close_max_s=args.close_max_s,
-                      loop_only=args.loops)
+                      loop_only=args.loops, loop_max_detour=args.loop_max_detour)
     ap_ = A.AllocParams()
     settings = {"profile": args.profile, "params": asdict(params) | {"f_min": params.f_min},
                 "alloc_params": asdict(ap_), "must_max_wait_s": args.must_max_wait_min * 60,
