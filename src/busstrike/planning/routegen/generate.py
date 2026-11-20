@@ -442,6 +442,11 @@ def _finish(c: Candidate, b: Builder, scenario: Scenario, p: Params,
     c.cycle_s, c.return_stops = cyc.period_s, cyc.return_stops
     if p.length_n is not None and c.cycle_s > cycle_limit_s(p, scenario):
         return "length_rule"
+    if c.shape == "loop" and g.turns_format is not None:
+        # 고리를 닫는 이음(끝 → 공차 → 기점 → 둘째 정류장)에서도 U턴하지 않는다
+        ring = c.stops + tuple(cyc.return_stops[1:]) + (c.stops[1],)
+        if g.has_uturn(ring):
+            return "loop_uturn"
     c.oneway_s = g.oneway_s(c.stops)
     c.length_m = g.length_m(c.stops)
     if c.shape == "loop":

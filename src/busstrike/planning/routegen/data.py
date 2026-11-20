@@ -77,6 +77,10 @@ class Network:
     tt: TravelTimeTable
     stops: dict[str, Stop]
     stations: dict[str, Station]
+    # 구간별 도로 조각 기록(버스 통행 가능 도로망 road.json과 같이 만든 turns.json). 정류장 U턴 판정에 쓴다
+    # (형식은 graph.parse_turns). 묶음 정류장 구간망에는 없다.
+    turns: dict | None = None
+    source: str = "bundle"            # bundle(묶음 network/travel_times.json) | road(버스 통행 가능 도로망)
 
     def stop_dist_m(self, a: str, b: str) -> float:
         sa, sb = self.stops[a], self.stops[b]
@@ -100,9 +104,22 @@ def _read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def load_network(root: Path) -> Network:
+def load_network(root: Path, road_dir: Path | None = None) -> Network:
+    """망 읽기. road_dir를 주면 버스 통행 가능 도로망(road_dir/road.json, turns.json)을 쓴다.
+
+    정류장·역·역 지정 정류장은 묶음 network/에서 읽는다. 도로망의 망 ID는 묶음 망 ID와 같아야 한다(변환기 C6).
+    """
     net = root / "network"
-    tt = TravelTimeTable.from_dict(sio.read_json(net / "travel_times.json"))
+    turns = None
+    if road_dir is None:
+        tt = TravelTimeTable.from_dict(sio.read_json(net / "travel_times.json"))
+    else:
+        tt = TravelTimeTable.from_dict(sio.read_json(Path(road_dir) / "road.json"))
+        bundle_id = _network_id(net / "travel_times.json")
+        if tt.network_snapshot_id != bundle_id:
+            raise ValueError(f"도로망 망 ID {tt.network_snapshot_id} != 묶음 망 ID {bundle_id}")
+        tp = Path(road_dir) / "turns.json"
+        turns = sio.read_json(tp) if tp.exists() else None
     stops = {r["stop_id"]: Stop(r["stop_id"], r["stop_name"], float(r["stop_lat"]), float(r["stop_lon"]), r["gu"])
              for r in _read_csv(net / "stops.csv")}
     designated: dict[tuple[str, str], str] = {}
@@ -118,7 +135,7 @@ def load_network(root: Path) -> Network:
         sid = r["station_id"]
         stations[sid] = Station(sid, r["station_name"], float(r["stop_lat"]), float(r["stop_lon"]),
                                 designated.get((sid, "access")), designated.get((sid, "egress")))
-    return Network(tt, stops, stations)
+    return Network(tt, stops, stations, turns, "bundle" if road_dir is None else "road")
 
 
 @dataclass(frozen=True)

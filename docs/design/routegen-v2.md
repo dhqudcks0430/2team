@@ -3,6 +3,23 @@
 코드: `src/busstrike/planning/routegen/`(`must_stops.py`, `loop.py`, `generate.py`, `allocate.py`, `__main__.py`).
 테스트: `tests/planning/test_routegen_v2.py`. 이 문서는 구현과 기본값을 적는다. 성능 비교는 다음 실험에서 한다.
 
+## 0. 망: 버스 통행 가능 도로망만 (절대 조건)
+
+노선 생성과 시뮬레이션은 **버스 통행 가능 도로망**으로만 한다. v2는 `--network-dir`가 없으면 거절한다.
+- 도로망은 `road.json`(시뮬레이터 travel_times 형식)과 `turns.json`(구간별 도로 조각 기록)이다.
+  - 만드는 곳: fork `feat/routegen-lab`의 `experiments/routegen_lab/roadnet.py`.
+  - 내용: OSM에서 버스가 다닐 수 있는 도로를 뽑고, 정류장을 도로에 붙인 뒤, 도로를 따라 이웃 정류장을 잇는다.
+  - 기준본: 1c 단계의 `review1119/stage1c/nets/<구>/`(25개 구).
+- 정류장·역·역 지정 정류장은 묶음 `network/`에서 읽는다. 도로망의 망 ID는 묶음과 같아야 한다(변환기 C6).
+- 묶음 정류장 구간망(`network/travel_times.json`, 기존 버스 노선의 연속 정류장만 잇는 망)으로는 생성하지 않는다.
+  - 이 망에는 버스가 안 다니는 방향·회차 길이 없다. 그래서 개봉역처럼 기존 버스가 한 방향으로 크게 도는 곳은 노선이 안 생긴다.
+  - v4 구로에서 개봉역 수요 정류장 102곳 중 101곳이 역까지 망 경로 우회율 1.6을 넘었다.
+  - `--profile v1`(기존 결과 바이트 비교)만 묶음 망을 쓴다.
+- U턴: 정류장에서 제자리로 돌아 나오는 이음만 막고, 블록·순환로를 도는 것은 허용한다(`Graph.is_uturn`, 1c 규칙 그대로).
+  - 순회형은 이어 붙이는 자리와 고리를 닫는 이음(끝 → 공차 → 기점 → 둘째 정류장)까지 U턴 없는 경로로 잇는다.
+- 시뮬레이션 묶음은 원본 묶음을 복사하고 `travel_times.json`만 같은 도로망으로 바꾼 뒤, `run_inputs`를 시뮬레이터
+  함수(`arrivals.build_run_inputs`)로 다시 만든다(fork `run_networks.bundles_for`와 같음).
+
 ## 1. 필수 정류장
 
 ### 규칙 (결과를 보기 전에 고정, 바꾸지 않음)

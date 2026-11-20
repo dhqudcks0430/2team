@@ -3,6 +3,14 @@
 - 경로 가중치는 구간의 06~09시 프로필 중 **최댓값**이다(편도 상한을 재는 기준과 같다).
   같은 비용이면 정류장열이 사전순으로 앞선 경로(변환기 공차 경로 규칙과 같은 동률 처리).
 - 통과 정류장 표현이 시뮬레이터에 없으므로 경로 위 정류장은 모두 정차로 센다.
+- 망에 `turns`(버스 통행 가능 도로망의 구간별 도로 조각 기록)가 있으면 정류장에서 되돌아가는 이음(U턴)을 위반
+  "uturn"으로 센다(`is_uturn`, fork feat/routegen-lab 1단계·1c 규칙 그대로). 좁은 길에서 버스가 실제로 못 돌기
+  때문이다. 제자리에서 돌아 나오는 것만 막고, 블록·순환로를 돌아 반대쪽으로 가는 것은 허용한다.
+  - turns-v2(`{"_meta": {"format": "turns-v2"}, "a>b": {"s", "e", "tail", "head"}}`): a→b→c가 b에서 U턴 ⇔
+    (1) a→b 도착 정차 노드 ≠ b→c 출발 정차 노드, 또는 (2) b→c 앞부분(head)이 a→b 끝부분(tail)이 지난 도로 조각을
+    반대 방향으로 되짚는다.
+  - 예전 형식(`"a>b": [첫 조각 u, v, 마지막 조각 u, v]`): b→c 첫 조각 = a→b 마지막 조각의 역방향일 때.
+  - 조각 기록이 없는 구간이 끼면 판단하지 않는다(U턴 아님).
 """
 
 from __future__ import annotations
@@ -11,6 +19,29 @@ import heapq
 from dataclasses import dataclass
 
 from .data import Network
+
+
+TURNS_V2 = "turns-v2"
+
+
+def parse_turns(turns: dict | None):
+    """turns 기록 → (형식, 구간 → 판정용 값). 형식 = None(기록 없음) | "v1"(예전) | "v2"."""
+    if not turns:
+        return None, {}
+    meta = turns.get("_meta")
+    if isinstance(meta, dict):
+        if meta.get("format") != TURNS_V2:
+            raise ValueError(f"모르는 turns 형식: {meta.get('format')}")
+        out = {}
+        for k, r in turns.items():
+            if k == "_meta":
+                continue
+            out[k] = (r["s"], r["e"], frozenset(tuple(x) for x in r["tail"]),
+                      frozenset((x[1], x[0]) for x in r["head"]))
+        return "v2", out
+    if all(isinstance(v, list) and len(v) == 4 for v in turns.values()):
+        return "v1", turns
+    raise ValueError("turns 형식을 알 수 없다(예전 [u, v, u, v] 목록도 turns-v2도 아님)")
 
 
 @dataclass(frozen=True)
@@ -26,6 +57,7 @@ class Graph:
         self.tt = net.tt
         self.dwell_s = dwell_s
         self.cutoff_s = cutoff_s
+        self.turns_format, self._turns = parse_turns(getattr(net, "turns", None))
         self._w: dict[tuple[str, str], int] = {}
         self._prof: dict[tuple[str, str], tuple[int, ...]] = {}
         bins = self.tt.bin_starts()
@@ -64,6 +96,57 @@ class Graph:
                     heapq.heappush(heap, (c, path + (nxt,)))
         cache[src] = done
         return done
+
+    def is_uturn(self, a: str, b: str, c: str) -> bool:
+        """a→b→c가 정류장 b에서 U턴인가(두 구간 모두 도로 조각 기록이 있을 때만 판단)."""
+        if self.turns_format is None:
+            return False
+        e1, e2 = self._turns.get(f"{a}>{b}"), self._turns.get(f"{b}>{c}")
+        if not (e1 and e2):
+            return False
+        if self.turns_format == "v1":
+            return e2[0] == e1[3] and e2[1] == e1[2]
+        return e1[1] != e2[0] or not e1[2].isdisjoint(e2[3])
+
+    def has_uturn(self, stops: tuple[str, ...]) -> bool:
+        return any(self.is_uturn(a, b, c) for a, b, c in zip(stops, stops[1:], stops[2:]))
+
+    def path_continue(self, prev: str | None, a: str, b: str, avoid=frozenset(), then: str | None = None,
+                      limit: int | None = None) -> tuple[str, ...] | None:
+        """a → b 최단경로. 직전 정류장 prev에서 a로 들어온 뒤 a·경로 중간에서 U턴하지 않고 avoid를 지나지 않는다.
+
+        상태 = (직전 정류장, 현재 정류장). then을 주면 b에서도 U턴하지 않는(직전 → b → then) 경로만 받는다.
+        """
+        limit = self.cutoff_s if limit is None else limit
+        start = (prev, a)
+        best = {start: 0}
+        back: dict[tuple, tuple | None] = {start: None}
+        h = [(0, prev or "", a)]
+        while h:
+            c, pv, u = heapq.heappop(h)
+            st = (pv or None, u)
+            if c > best.get(st, 1 << 62):
+                continue
+            if u == b and (then is None or st[0] is None or not self.is_uturn(st[0], b, then)):
+                out = []
+                while st is not None:
+                    out.append(st[1])
+                    st = back[st]
+                return tuple(reversed(out))
+            if u == b:
+                continue
+            for v in self.tt.successors(u):
+                if v in avoid or v == st[0]:
+                    continue
+                if st[0] is not None and self.is_uturn(st[0], u, v):
+                    continue
+                nc = c + self._w[(u, v)]
+                ns = (u, v)
+                if nc <= limit and nc < best.get(ns, 1 << 62):
+                    best[ns] = nc
+                    back[ns] = st
+                    heapq.heappush(h, (nc, u, v))
+        return None
 
     def path(self, a: str, b: str) -> tuple[str, ...] | None:
         if a == b:
@@ -128,4 +211,6 @@ class Graph:
             bad.append("max_stops")
         if self.detour(stops) > lim.max_detour:
             bad.append("detour")
+        if self.has_uturn(stops):
+            bad.append("uturn")
         return bad

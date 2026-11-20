@@ -19,7 +19,8 @@
 
 프로필(설계 v2 5절; 명시한 인자가 프로필 값보다 앞선다)
 - `--profile v1`: 순회형 끔, 필수 정류장 끔, 고정 한도(편도 20·30분, 정차 8) → 기존 v1과 바이트 단위로 같은 plan.json.
-- `--profile v2`(기본): 순환 운행만(편도 노선은 배분 후보·결과에 없다), 필수 정류장 켬(`--facilities` 필요),
+- `--profile v2`(기본): **버스 통행 가능 도로망으로만**(`--network-dir`의 road.json·turns.json, 없으면 거절),
+  순환 운행만(편도 노선은 배분 후보·결과에 없다), 필수 정류장 켬(`--facilities` 필요),
   길이 규칙 N=2, 정차 상한 없음, 우회율 1.6(고리 전체 ÷ 2×폭), 닫는 공차 ≤ 300초, 길 건너 짝 100m.
   v1은 기존 결과와 바이트 비교(회귀)용이다. v1 안은 편도 + 빈 차 복귀라 운행안으로 쓰지 않는다.
 
@@ -140,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="순회형 우회율 재는 법. 기본: 프로필(v2 loop_total)")
     ap.add_argument("--close-max-s", type=_opt_int, default=UNSET,
                     help="순회형 닫는 공차(끝 → 기점) 상한(초). none = 없음. 기본: 프로필(v2 300)")
+    ap.add_argument("--network-dir", type=Path, default=None,
+                    help="버스 통행 가능 도로망 폴더(road.json, turns.json). v2는 반드시 준다")
     ap.add_argument("--od-csv", type=Path, default=None,
                     help="정류장 → 정류장 수요(date,hour,origin_stop,dest_stop,flow). 주면 demand_flows 대신 쓴다")
     ap.add_argument("--scenario-variant", default="affected", help="--od-csv일 때 시나리오를 읽을 묶음 변형")
@@ -149,6 +152,11 @@ def main(argv: list[str] | None = None) -> int:
               "loop_detour", "close_max_s"):
         if getattr(args, k) is UNSET:
             setattr(args, k, prof[k])
+    if args.profile == "v2" and args.network_dir is None:
+        raise SystemExit("v2는 버스 통행 가능 도로망으로만 생성한다 — --network-dir <road.json·turns.json 폴더>를 준다"
+                         "(묶음 정류장 구간망으로는 생성하지 않는다)")
+    if args.network_dir is not None and not (args.network_dir / "road.json").exists():
+        raise SystemExit(f"도로망이 없다: {args.network_dir / 'road.json'}")
     if args.profile == "v2" and not args.loops:
         raise SystemExit("v2는 순환 운행만 만든다 — 편도 노선안(--no-loops)은 없다")
     if args.must_stops and args.facilities is None:
@@ -167,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     (out / "plans").mkdir(parents=True, exist_ok=True)
     started = time.time()
 
-    net = D.load_network(root)
+    net = D.load_network(root, args.network_dir)
     if args.od_csv is None:
         rows = D.load_flows(root)
         check = D.check_bundles(root, rows, args.fleets[0])
@@ -203,6 +211,11 @@ def main(argv: list[str] | None = None) -> int:
                 "facilities": str(args.facilities) if args.facilities else None,
                 "facilities_sha256": sio.sha256_file(args.facilities) if args.facilities else None,
                 "od_csv": str(args.od_csv) if args.od_csv else None, "fleets": list(args.fleets),
+                "network_source": net.source,
+                "network_dir": str(args.network_dir.resolve()) if args.network_dir else None,
+                "road_sha256": sio.sha256_file(args.network_dir / "road.json") if args.network_dir else None,
+                "turns_sha256": (sio.sha256_file(args.network_dir / "turns.json")
+                                 if args.network_dir and (args.network_dir / "turns.json").exists() else None),
                 "loop_only": params.loop_only,
                 "variants": args.variants, "root": str(root), "network_snapshot_id": net.tt.network_snapshot_id}
     settings_sha = _sha(settings)

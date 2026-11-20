@@ -362,3 +362,76 @@ class GenerateV2Test(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- 버스 통행 가능 도로망·U턴
+
+def _turn(s, e, tail, head):
+    return {"s": s, "e": e, "tail": [list(x) for x in tail], "head": [list(x) for x in head]}
+
+
+class RoadNetworkTest(unittest.TestCase):
+    def test_uturn_rule_v2(self):
+        net = street_network()
+        net.turns = {"_meta": {"format": "turns-v2"},
+                     "N4>H": _turn(1, 2, [(10, 11)], [(1, 10)]),
+                     "H>E": _turn(2, 3, [(11, 30)], [(11, 10)]),      # head 뒤집으면 (10, 11) = N4>H tail → U턴
+                     "E>S4": _turn(3, 4, [(30, 40)], [(30, 31)])}
+        g = Graph(net, 10, 7200)
+        self.assertTrue(g.is_uturn("N4", "H", "E"))
+        self.assertFalse(g.is_uturn("H", "E", "S4"))
+        self.assertFalse(g.is_uturn("N3", "N4", "H"))                 # 기록이 없으면 판단하지 않음
+        net.turns["E>S4"] = _turn(9, 4, [(30, 40)], [(30, 31)])       # 출발 정차 노드가 다르면(길 건너로 바꿔 탐) U턴
+        self.assertTrue(Graph(net, 10, 7200).is_uturn("H", "E", "S4"))
+
+    def test_loop_avoids_uturn_at_station(self):
+        # H에서 E로 바로 건너면 U턴. H → X → E로 블록을 돌아가는 길은 허용
+        stops = {f"N{i}": _st(f"N{i}", f"P{i}", i) for i in range(1, 5)}
+        stops.update({f"S{i}": _st(f"S{i}", f"P{i}", i, -0.05) for i in range(1, 5)})
+        stops.update({"H": _st("H", "역앞", 5), "E": _st("E", "역건너", 5, -0.05), "X": _st("X", "블록", 5.6, -0.02)})
+        pairs = [("N1", "N2"), ("N2", "N3"), ("N3", "N4"), ("N4", "H"), ("H", "E"), ("H", "X"), ("X", "E"),
+                 ("E", "S4"), ("S4", "S3"), ("S3", "S2"), ("S2", "S1"), ("S1", "N1")]
+        tt = TravelTimeTable.from_dict({"schema_version": 1, "network_snapshot_id": "syn-1", "valid_from_s": 21600,
+                                        "valid_until_s": 43200, "segments": _segments(stops, pairs)})
+        turns = {"_meta": {"format": "turns-v2"},
+                 "N4>H": _turn(1, 2, [(10, 11)], [(1, 10)]),
+                 "H>E": _turn(2, 3, [(11, 30)], [(11, 10)]),
+                 "H>X": _turn(2, 5, [(11, 50)], [(11, 12)]),
+                 "X>E": _turn(5, 3, [(50, 30)], [(50, 51)])}
+        net = Network(tt, stops, {"K": Station("K", "역", stops["H"].lat, stops["H"].lon + 0.0005, "H", "E")},
+                      turns, "road")
+        g = Graph(net, 10, 7200)
+        b = LoopMaker(net, g, self.od_total(), 3.0, None, 7020, close_max_s=300).build(("N1", "N2", "N3", "N4", "H"))
+        self.assertIsNotNone(b)
+        self.assertEqual(b.stops[4:7], ("H", "X", "E"))
+        self.assertFalse(g.has_uturn(b.stops))
+        self.assertIn("uturn", loop_violations(g, ("N1", "N2", "N3", "N4", "H", "E", "S4", "S3"), 4, 9, None, 7020))
+
+    @staticmethod
+    def od_total():
+        return {k: sum(v) for k, v in street_demand().od.items()}
+
+    def test_v2_requires_road_network(self):
+        from busstrike.planning.routegen.__main__ import main
+        with self.assertRaises(SystemExit) as cm:
+            main(["--root", "nowhere", "--out", "nowhere_out"])
+        self.assertIn("버스 통행 가능 도로망", str(cm.exception))
+        with self.assertRaises(SystemExit) as cm:
+            main(["--root", "nowhere", "--out", "nowhere_out", "--network-dir", "nowhere_net"])
+        self.assertIn("도로망이 없다", str(cm.exception))
+
+    def test_road_network_id_must_match_bundle(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root, road = Path(tmp.name) / "b", Path(tmp.name) / "road"
+        (root / "network").mkdir(parents=True)
+        road.mkdir()
+        base = {"schema_version": 1, "valid_from_s": 21600, "valid_until_s": 43200, "segments": []}
+        (root / "network" / "travel_times.json").write_text(
+            '{"network_snapshot_id": "guro-buf2km-0610-v2", "schema_version": 1, "valid_from_s": 21600, '
+            '"valid_until_s": 43200, "segments": []}', encoding="utf-8")
+        import json as _json
+        (road / "road.json").write_text(_json.dumps(dict(base, network_snapshot_id="other-net")), encoding="utf-8")
+        from busstrike.planning.routegen.data import load_network
+        with self.assertRaises(ValueError):
+            load_network(root, road)

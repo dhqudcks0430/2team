@@ -109,6 +109,8 @@ def loop_violations(g: Graph, stops: tuple[str, ...], turn: int, max_detour: flo
         return bad
     if g.oneway_s(stops) > length_s:
         bad.append("length")
+    if g.has_uturn(stops):
+        bad.append("uturn")
     fwd, back = stops[:turn + 1], stops[turn:]
     if detour_mode == "loop_total":
         if loop_detour(g, stops, turn, "loop_total") > max_detour:
@@ -149,7 +151,10 @@ class LoopMaker:
             if t in used:
                 skipped.append(t)
                 continue
-            p = self.g.path(seq[-1], t)
+            if self.g.turns_format is None:
+                p = self.g.path(seq[-1], t)
+            else:                                      # 도로망: 이어 붙인 자리·경로 중간에서 U턴하지 않는 경로
+                p = self.g.path_continue(seq[-2] if len(seq) > 1 else None, seq[-1], t, avoid=used - {seq[-1]})
             if p is None or any(x in used for x in p[1:]):
                 skipped.append(t)
                 continue
@@ -177,6 +182,8 @@ class LoopMaker:
         """seq 끝 → 기점(seq[0]) 망 최단경로, seq의 다른 정류장은 지나지 않는다(S2). 없으면 None."""
         start, goal = seq[-1], seq[0]
         banned = set(seq[1:-1])
+        if self.g.turns_format is not None:            # 도로망: 끝·기점에서도 U턴하지 않게(기점 다음 = 둘째 정류장)
+            return self.g.path_continue(seq[-2], start, goal, avoid=banned, then=seq[1], limit=self.length_s)
         import heapq
         heap = [(0, (start,))]
         done: set[str] = set()
