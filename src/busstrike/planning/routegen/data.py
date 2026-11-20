@@ -193,6 +193,57 @@ def build_demand(rows: list[FlowRow], variant: str) -> Demand:
     return d
 
 
+@dataclass(frozen=True)
+class OdRow:
+    date: str
+    hour: int
+    origin_stop: str
+    dest_stop: str
+    flow: float
+
+
+def load_od_csv(path: Path) -> list[OdRow]:
+    """정류장 → 정류장 수요(v2 통일 고려조건). 열: date, hour(6~9), origin_stop, dest_stop, flow."""
+    out = []
+    for r in _read_csv(Path(path)):
+        h = int(r["hour"])
+        if h not in HOURS:
+            raise ValueError(f"hour는 {HOURS} 중 하나다: {h}")
+        out.append(OdRow(r["date"], h, r["origin_stop"], r["dest_stop"], float(r["flow"])))
+    return out
+
+
+def build_demand_od(rows: list[OdRow], net: Network, variant: str = "od") -> Demand:
+    """정류장 → 정류장 수요의 5일(날짜 수) 평균.
+
+    목적지가 역 access 지정 정류장인 OD는 그 역의 access 쌍, 출발지가 역 egress 지정 정류장인 OD는 egress 쌍으로도
+    센다(허브·권역용). 그래서 목적지가 역 정류장인 기존 입력은 이 함수의 특수한 경우로 같은 Demand가 된다.
+    역 정류장이 아닌 OD는 덮개·충족(od)에만 들어간다.
+    """
+    by_access: dict[str, list[str]] = {}
+    by_egress: dict[str, list[str]] = {}
+    for k in sorted(net.stations):
+        st = net.stations[k]
+        if st.access_stop:
+            by_access.setdefault(st.access_stop, []).append(k)
+        if st.egress_stop:
+            by_egress.setdefault(st.egress_stop, []).append(k)
+    dates = tuple(sorted({r.date for r in rows}))
+    nd = len(dates)
+    d = Demand(variant, dates)
+    for r in rows:
+        f = r.flow / nd
+        if f <= 0 or r.origin_stop == r.dest_stop:
+            continue
+        h = HOURS.index(r.hour)
+        d.od.setdefault((r.origin_stop, r.dest_stop), [0.0] * 4)[h] += f
+        for k in by_access.get(r.dest_stop, [])[:1]:
+            d.pair.setdefault(("access", r.origin_stop, k), [0.0] * 4)[h] += f
+        for k in by_egress.get(r.origin_stop, [])[:1]:
+            d.pair.setdefault(("egress", r.dest_stop, k), [0.0] * 4)[h] += f
+    return d
+
+
 def read_scenario(bundle_dir: Path, fleet: int) -> Scenario:
     return sio.scenario_from_dict(sio.read_json(bundle_dir / f"scenario_f{fleet}.json"))
 

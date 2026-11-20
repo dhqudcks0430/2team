@@ -8,8 +8,20 @@
    삽입 점수 = 증가 덮개 수요 ÷ 증가 편도 시간. 제약(편도·정차 수·우회율·S2) 위반 삽입은 버린다. 끝에 2-opt 1회.
 5. 추가 후보: 허브·방향마다 수요 상위 seed의 최단경로 피더(삽입 휴리스틱의 비교 기준).
 6. 패턴: 회송 피더(access: 정류장들 → 역 access 정류장, egress: 역 egress 정류장 → 정류장들),
-   편도 연결(역 i egress 정류장 → 정류장들 → 역 j access 정류장). 순환·양방향 영업은 만들지 않는다.
+   편도 연결(역 i egress 정류장 → 정류장들 → 역 j access 정류장).
 7. 후보 처리: 덮개(노선 위 o가 d보다 앞인 OD), 주기(`cycle.route_cycle`), 중복 제거(Jaccard).
+
+v2(설정으로 켠다. 기본값은 모두 v1과 같은 동작 — `--profile v1`이 기존 plan.json을 바이트 단위로 그대로 낸다)
+- loops: 편도 후보마다 순회형(기점 → 회차 → 기점, `loop.LoopMaker`) 버전을 같이 만든다. kind = loop_<편도 kind>.
+- length_n: 길이 상한 = 운행 창 안에 N회 이상 돌 수 있는 길이. 생성 중에는 영업 시간 ≤ 창/N − 회차,
+  마지막에 시뮬레이터 주기 ≤ 창/N. 주면 l_max_min(편도 20·30분) 대신 쓴다.
+- must_stops: 필수 정류장(`must_stops`)마다 ① 우회율 한도 안에서 기존 후보에 끼운 버전(origin must_insert),
+  ② 필수 정류장 → 가까운 역 access 정류장 전용 편도·순회형(origin must_feeder, 피더안 풀에도 넣는다).
+  전용 후보의 역 = 직선거리로 가까운 must_feeder_stations개 중 망 최단 시간이 가장 짧은 역(동률이면 직선거리·역 ID).
+  변환기를 못 지나는 역(역 → 필수 정류장 공차 경로 없음, RETURN)은 건너뛰고 다음 역을 쓴다.
+  전용 후보는 우회율을 보지 않는다(길이 규칙·S2·정차 상한만). 필수 정류장은 대개 망에서 갈래가 하나뿐인 곳이라
+  가까운 역까지도 망 경로가 직선의 3~20배다(v4 강서 실측).
+- endpoints: 노선 끝점(편도 첫·끝, 순회형 기점·회차)을 끝점 후보 집합 안으로 제한(all | stations | stations+depots).
 """
 
 from __future__ import annotations
@@ -23,6 +35,9 @@ from busstrike.sim.models import Scenario
 from .cycle import route_cycle
 from .data import Demand, Network, haversine_m
 from .graph import Graph, Limits
+from .loop import LoopMaker, loop_violations
+
+ENDPOINT_MODES = ("all", "stations", "stations+depots")
 
 
 @dataclass(frozen=True)
@@ -41,6 +56,16 @@ class Params:
     sp_top: int = 15
     jaccard: float = 0.8
     home_gu: str = "구로구"
+    # v2(기본값 = v1 동작)
+    loops: bool = False              # 순회형 후보를 같이 만든다
+    length_n: int | None = None      # 길이 규칙 N(운행 창 안에 N회). None = l_max_min 고정 한도
+    endpoints: str = "all"           # 끝점 후보 집합: all | stations | stations+depots
+    must_stops: tuple[str, ...] = ()  # 필수 정류장(비면 필수 정류장 후보를 만들지 않는다)
+    must_insert_radius_m: float = 600.0   # 이 거리 안에 정류장이 있는 후보에만 필수 정류장을 끼워 본다
+    must_feeder_stations: int = 3    # 전용 후보: 가까운 역 몇 개까지 시도
+    pair_radius_m: float = 50.0      # 길 건너 짝: 이름이 같고 이 거리 안
+    return_detour: float | None = None   # 순회형 오는 쪽 우회율 상한(None = max_detour)
+    loop_insert_top: int = 30        # 순회형 오는 쪽에 끼울 수요 정류장 후보 수(값 큰 순)
 
     @property
     def f_min(self) -> float:
@@ -65,11 +90,16 @@ class Candidate:
     cover: float = 0.0                # 덮는 수요(4시간 합, 5일 평균)
     cover_keys: tuple[tuple[str, str], ...] = ()
     cross_gu: bool = False
+    shape: str = "oneway"             # oneway | loop
+    turn: int | None = None           # 순회형 회차 정류장 인덱스
+    loop_info: dict | None = None     # 순회형 짝·건너뜀·끼움·공차(보고용)
+    must: tuple[str, ...] = ()        # 노선이 지나는 필수 정류장
 
     def record(self) -> dict:
         d = asdict(self)
         d["stops"] = list(self.stops)
         d["return_stops"] = list(self.return_stops)
+        d["must"] = list(self.must)
         d["cover_keys"] = [list(k) for k in self.cover_keys]
         d["cover"] = round(self.cover, 4)
         d["detour"] = round(self.detour, 4)
@@ -353,32 +383,84 @@ class Result:
     seconds: dict[str, float] = field(default_factory=dict)
     reasons: dict[str, int] = field(default_factory=dict)   # "단계/kind/사유" → 횟수(단계 = seed_L20, insertion_L30 …)
     reason_sets: dict[str, int] = field(default_factory=dict)   # "단계/kind/사유1+사유2" → 횟수
+    loop_stats: dict = field(default_factory=dict)          # v2 순회형 만들기 집계
+    must_stats: dict = field(default_factory=dict)          # v2 필수 정류장 후보 집계
 
 
-def _finish(c: Candidate, b: Builder, scenario: Scenario, p: Params) -> bool:
+def length_limits(p: Params, scenario: Scenario) -> list[tuple[str, int]]:
+    """생성 중 편도(영업) 시간 상한 목록 [(태그, 초)]. v1 = 편도 L_max분 고정, v2 = 창/N − 회차."""
+    if p.length_n is None:
+        return [(f"L{L}", L * 60) for L in p.l_max_min]
+    return [(f"N{p.length_n}", cycle_limit_s(p, scenario) - scenario.policy.turnaround_s)]
+
+
+def cycle_limit_s(p: Params, scenario: Scenario) -> int:
+    """운행 창 안에 N회 이상 돌 수 있는 주기 상한 = (창 끝 − 창 시작) // N."""
+    w = scenario.window
+    return (w.end_s - w.start_s) // p.length_n
+
+
+def _station_stops(net: Network, hubs: tuple[str, ...]) -> frozenset[str]:
+    return frozenset(x for x in (
+        [net.stations[h].access_stop for h in hubs] + [net.stations[h].egress_stop for h in hubs]) if x)
+
+
+def endpoint_set(net: Network, mode: str, depots: frozenset[str] = frozenset()) -> frozenset[str] | None:
+    """끝점 후보 집합. all = None(제한 없음), stations = 역 지정 정류장, stations+depots = + 기점(GTFS 노선 첫 정류장)."""
+    if mode not in ENDPOINT_MODES:
+        raise ValueError(f"endpoints는 {ENDPOINT_MODES} 중 하나다: {mode}")
+    if mode == "all":
+        return None
+    st = frozenset(x for k in net.stations.values() for x in (k.access_stop, k.egress_stop) if x)
+    return st if mode == "stations" else st | frozenset(depots)
+
+
+def terminals(c: Candidate) -> tuple[str, str]:
+    """노선 끝점: 편도 = (첫, 끝), 순회형 = (기점, 회차)."""
+    if c.shape == "loop":
+        return c.stops[0], c.stops[c.turn]
+    return c.stops[0], c.stops[-1]
+
+
+def _finish(c: Candidate, b: Builder, scenario: Scenario, p: Params,
+            endpoints: frozenset[str] | None = None) -> str | None:
+    """덮개·주기·지표를 채운다. 성공이면 None, 버리면 사유(conversion_failed | length_rule | endpoint)."""
     g, net = b.g, b.net
-    st_stops = frozenset(x for x in (
-        [net.stations[h].access_stop for h in c.hubs] + [net.stations[h].egress_stop for h in c.hubs]) if x)
+    st_stops = _station_stops(net, c.hubs)
     end_stops = frozenset(x for x in (c.stops[0], c.stops[-1]) if x in st_stops)
+    if endpoints is not None and any(x not in endpoints for x in terminals(c)):
+        return "endpoint"
     cyc = route_cycle(c.stops, net.tt, scenario)
     if cyc is None:
-        return False
+        return "conversion_failed"
     c.cycle_s, c.return_stops = cyc.period_s, cyc.return_stops
+    if p.length_n is not None and c.cycle_s > cycle_limit_s(p, scenario):
+        return "length_rule"
     c.oneway_s = g.oneway_s(c.stops)
     c.length_m = g.length_m(c.stops)
-    c.detour = g.detour(c.stops)
-    c.n_stops = sum(1 for s in c.stops if s not in end_stops)
+    if c.shape == "loop":
+        c.detour = max(g.detour(c.stops[:c.turn + 1]), g.detour(c.stops[c.turn:]))
+        c.n_stops = sum(1 for s in c.stops if s not in st_stops)
+    else:
+        c.detour = g.detour(c.stops)
+        c.n_stops = sum(1 for s in c.stops if s not in end_stops)
     c.cover_keys = tuple(covered_keys(c.stops, b.demand.od))
     c.cover = sum(b.od_total[k] for k in c.cover_keys)
     c.cross_gu = any(net.stops[s].gu != p.home_gu for s in c.stops)
-    return True
+    if p.must_stops:
+        must = set(p.must_stops)
+        c.must = tuple(s for s in c.stops if s in must)
+    return None
 
 
 def direction_key(c: Candidate) -> tuple:
     """같은 방향 = 같은 kind + 같은 고정 역 정류장(access 끝, egress 시작, connect 둘 다).
 
     역 ID가 아니라 정류장으로 본다(온수 1821·2752처럼 역 둘이 지정 정류장 하나를 같이 쓰면 같은 노선이다).
+    순회형은 (기점, 회차) 정류장이 같으면 같은 방향이다.
     """
+    if c.shape == "loop":
+        return ("loop", c.stops[0], c.stops[c.turn])
     if c.kind == "access":
         return ("access", c.stops[-1])
     if c.kind == "egress":
@@ -391,6 +473,7 @@ def dedupe(cands: list[Candidate], threshold: float) -> tuple[list[Candidate], i
 
     방향이 다른 노선(예: access A→역과 egress 역→A)은 정류장 집합이 같아도 다른 승객을 태우므로 비교하지 않는다.
     동률이면 덮개가 큰 쪽, 그다음 정차열 사전순.
+    필수 정류장을 지나는 노선은 같은 필수 정류장을 지나는 노선과만 중복으로 본다(끼운 버전이 지워지지 않게).
     """
     order = sorted(cands, key=lambda c: (c.cycle_s, -c.cover, c.stops, c.origin))
     kept: list[Candidate] = []
@@ -399,7 +482,7 @@ def dedupe(cands: list[Candidate], threshold: float) -> tuple[list[Candidate], i
         dup = False
         dk = direction_key(c)
         for k in kept:
-            if direction_key(k) != dk:
+            if direction_key(k) != dk or k.must != c.must:
                 continue
             sk = set(k.stops)
             if len(sc & sk) / len(sc | sk) >= threshold:
@@ -411,7 +494,39 @@ def dedupe(cands: list[Candidate], threshold: float) -> tuple[list[Candidate], i
     return kept, len(cands) - len(kept)
 
 
-def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Params()) -> Result:
+def _reverse_pool(hubs: tuple[str, ...], K: dict[str, dict[str, float]], demand: Demand,
+                  limit: int) -> list[str]:
+    """순회형 오는 쪽에 끼울 수요 정류장: 노선 역들의 권역 정류장, access+egress 수요 큰 순."""
+    vals: dict[str, float] = {}
+    for h in hubs:
+        for s in K.get(h, {}):
+            v = sum(sum(demand.pair.get((kind, s, h), ())) for kind in ("access", "egress"))
+            if v > 0:
+                vals[s] = vals.get(s, 0.0) + v
+    return sorted(vals, key=lambda s: (-vals[s], s))[:limit]
+
+
+def _insert_must(g: Graph, stops: tuple[str, ...], turn: int | None, m: str
+                 ) -> tuple[tuple[str, ...], int | None] | None:
+    """필수 정류장 m을 정차열에 끼운다(영업 시간 증가가 가장 작은 자리, 동률이면 앞자리). S2를 깨면 그 자리는 버린다."""
+    best = None
+    for i in range(len(stops) - 1):
+        p1, p2 = g.path(stops[i], m), g.path(m, stops[i + 1])
+        if p1 is None or p2 is None:
+            continue
+        new = stops[:i + 1] + p1[1:] + p2[1:] + stops[i + 2:]
+        if len(set(new)) != len(new):
+            continue
+        t = g.oneway_s(new)
+        nt = turn if turn is None or i >= turn else turn + (len(new) - len(stops))
+        if best is None or (t, i) < best[0]:
+            best = ((t, i), new, nt)
+    return (best[1], best[2]) if best else None
+
+
+def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Params(),
+             depots: frozenset[str] = frozenset()) -> Result:
+    """depots = 기점 후보(묶음 GTFS 노선 첫 정류장). endpoints = stations+depots일 때만 쓴다."""
     t0 = time.time()
     hubs = hubs_of(demand, net, p)
     K = catchments(demand, net, hubs, p)
@@ -425,37 +540,40 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
         cl["cross_gu"] = gus != [p.home_gu]
     t_setup = time.time()
 
-    graph = Graph(net, scenario.policy.dwell_base_s, cutoff_s=max(p.l_max_min) * 60)
+    limits = length_limits(p, scenario)
+    graph = Graph(net, scenario.policy.dwell_base_s, cutoff_s=max(s for _, s in limits))
     b = Builder(net, graph, demand, p)
     raw: dict[tuple, Candidate] = {}
     dropped = {"seed_infeasible": 0, "conversion_failed": 0}
 
-    def add(kind, stops, origin, hubs_, cluster, tag):
+    def add(kind, stops, origin, hubs_, cluster, tag, shape="oneway", turn=None, loop_info=None):
         key = (origin, kind, hubs_, stops)
         if key in raw:
             raw[key].made_by = tuple(sorted(set(raw[key].made_by) | {tag}))
             return
-        raw[key] = Candidate("", kind, stops, origin, hubs_, cluster, (tag,))
+        raw[key] = Candidate("", kind, stops, origin, hubs_, cluster, (tag,), shape=shape, turn=turn,
+                             loop_info=loop_info)
 
     # 4. 섹터 분할 + 최선 삽입
     for cl in clusters:
         for pat in _patterns(cl["hubs"], net):
             values = _pool(pat, K, demand)
-            for L in p.l_max_min:
-                lim = Limits(L * 60, p.max_stops, p.max_detour)
-                feas = [s for s in values if b.route_of(pat, pat.anchors_with(s), lim, f"seed_L{L}") is not None]
+            for tag, L_s in limits:
+                lim = Limits(L_s, p.max_stops, p.max_detour)
+                feas = [s for s in values if b.route_of(pat, pat.anchors_with(s), lim, f"seed_{tag}") is not None]
                 dropped["seed_infeasible"] += len(values) - len(feas)
                 for m in p.sectors:
                     for sec in sectors(feas, values, pat.center, m, net):
                         seed = max(sec, key=lambda s: (values[s] * haversine_m(
                             pat.center[0], pat.center[1], net.stops[s].lat, net.stops[s].lon), s))
-                        stops = b.insertion(pat, seed, sec, lim, f"insertion_L{L}")
+                        stops = b.insertion(pat, seed, sec, lim, f"insertion_{tag}")
                         if stops is not None:
-                            add(pat.kind, stops, "generated", pat.hubs, cl["id"], f"m{m}_L{L}")
+                            add(pat.kind, stops, "generated", pat.hubs, cl["id"], f"m{m}_{tag}")
     t_gen = time.time()
 
     # 5. 최단경로 피더(허브·방향마다 수요 상위 sp_top seed, 같은 제약·L_max 최댓값)
-    lim = Limits(max(p.l_max_min) * 60, p.max_stops, p.max_detour)
+    tag_max, L_max_s = max(limits, key=lambda x: x[1])
+    lim = Limits(L_max_s, p.max_stops, p.max_detour)
     cl_of = {h: cl["id"] for cl in clusters for h in cl["hubs"]}
     for h in hub_ids:
         for pat in _patterns([h], net):
@@ -465,34 +583,123 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
             for s in ranked:
                 if picked >= p.sp_top:
                     break
-                stops = b.route_of(pat, pat.anchors_with(s), lim, f"sp_L{max(p.l_max_min)}")
+                stops = b.route_of(pat, pat.anchors_with(s), lim, f"sp_{tag_max}")
                 if stops is None:
                     continue
                 picked += 1
                 add(pat.kind, stops, "shortest_path_feeder", pat.hubs, cl_of[h], f"sp:{s}")
     t_sp = time.time()
 
+    # v2-a. 필수 정류장 전용 편도(필수 정류장 → 가까운 역 access 정류장)
+    must_stats: dict = {}
+    must = [m for m in sorted(set(p.must_stops))]
+    if must:
+        known = net.tt.stop_ids()
+        must_stats = {"must_stops": must, "not_in_network": [m for m in must if m not in known],
+                      "feeder": {}, "insert": {}}
+        stations = sorted((k for k, st in net.stations.items() if st.access_stop and st.access_stop in known))
+        lim_free = Limits(L_max_s, p.max_stops, float("inf"))
+        for m in must:
+            if m not in known:
+                continue
+            near = sorted(stations, key=lambda k: (net.station_stop_dist_m(k, m), k))[: p.must_feeder_stations]
+            ranked = []
+            for k in near:
+                hit = graph.tree(m).get(net.stations[k].access_stop)
+                if hit is not None:
+                    ranked.append((hit[0], net.station_stop_dist_m(k, m), k))
+            made = None
+            for _, _, k in sorted(ranked):
+                pat = Pattern("access", (k,), None, net.stations[k].access_stop,
+                              (net.stations[k].lat, net.stations[k].lon))
+                stops = b.route_of(pat, [m, net.stations[k].access_stop], lim_free, f"must_{tag_max}")
+                if stops is not None and route_cycle(stops, net.tt, scenario) is None:
+                    must_stats.setdefault("feeder_no_return", {}).setdefault(m, []).append(k)
+                    continue                                   # 역에서 필수 정류장으로 돌아올 망 경로가 없다(RETURN)
+                if stops is not None:
+                    add("access", stops, "must_feeder", (k,), cl_of.get(k), f"must:{m}")
+                    made = k
+                    break
+            must_stats["feeder"][m] = made
+    t_mf = time.time()
+
+    # v2-b. 순회형: 편도 후보마다(생성·피더·필수 전용) 순회형 버전
+    loop_stats: dict = {}
+    if p.loops:
+        maker = LoopMaker(net, graph, b.od_total, p.max_detour, p.max_stops, L_max_s, p.pair_radius_m,
+                          p.loop_insert_top, p.return_detour)
+        for key in sorted(raw, key=lambda k: (k[0], k[1], k[2], k[3])):
+            c = raw[key]
+            if c.shape != "oneway":
+                continue
+            built = maker.build(c.stops, _reverse_pool(c.hubs, K, demand, p.loop_insert_top),
+                                detour_free=c.origin == "must_feeder")
+            if built is None:
+                continue
+            info = {"from": list(c.stops[:1]) + [c.stops[-1]], "targets": built.targets, "paired": built.paired,
+                    "skipped": built.skipped, "inserted": built.inserted, "deadhead_s": built.deadhead_s}
+            add(f"loop_{c.kind}", built.stops, c.origin, c.hubs, c.cluster, "loop", "loop", built.turn, info)
+        loop_stats = dict(maker.stats, pairs_known=len(maker.pairs))
+    t_loop = time.time()
+
+    # v2-c. 필수 정류장을 기존 후보(편도·순회형)에 끼운 버전
+    if must:
+        lim_ins = lim
+        for key in sorted(raw, key=lambda k: (k[0], k[1], k[2], k[3])):
+            c = raw[key]
+            if c.origin == "must_insert":
+                continue
+            for m in must:
+                if m not in known or m in c.stops:
+                    continue
+                if min(net.stop_dist_m(m, s) for s in c.stops) > p.must_insert_radius_m:
+                    continue
+                got = _insert_must(graph, c.stops, c.turn, m)
+                ok = False
+                if got is not None:
+                    new, nt = got
+                    if c.shape == "loop":
+                        ok = not loop_violations(graph, new, nt, p.max_detour, p.max_stops, L_max_s, p.return_detour)
+                    else:
+                        ok = not graph.violations(new, _station_stops(net, c.hubs), lim_ins)
+                st = must_stats["insert"].setdefault(m, {"tried": 0, "ok": 0})
+                st["tried"] += 1
+                if ok:
+                    st["ok"] += 1
+                    add(c.kind, new, "must_insert", c.hubs, c.cluster, f"must:{m}", c.shape, nt,
+                        dict(c.loop_info or {}, must_inserted=m) if c.shape == "loop" else None)
+    t_mi = time.time()
+
     # 7. 덮개·주기
+    endpoints = endpoint_set(net, p.endpoints, depots)
     cands = []
     for key in sorted(raw, key=lambda k: (k[0], k[1], k[2], k[3])):
         c = raw[key]
-        if _finish(c, b, scenario, p):
+        why = _finish(c, b, scenario, p, endpoints)
+        if why is None:
             cands.append(c)
         else:
-            dropped["conversion_failed"] += 1
-    cands = [c for c in cands if c.cover > 0]
+            dropped[why] = dropped.get(why, 0) + 1
+    cands = [c for c in cands if c.cover > 0 or c.must]
     for i, c in enumerate(cands, start=1):
         c.route_id = f"c{i:04d}"
     t_fin = time.time()
+    seconds = {"setup": round(t_setup - t0, 2), "insertion": round(t_gen - t_setup, 2),
+               "shortest_path_feeders": round(t_sp - t_gen, 2), "cover_cycle": round(t_fin - t_mi, 2)}
+    if must:
+        seconds.update(must_feeders=round(t_mf - t_sp, 2), must_insert=round(t_mi - t_loop, 2))
+    if p.loops:
+        seconds["loops"] = round(t_loop - t_mf, 2)
     return Result(p, hubs, {k: len(v) for k, v in K.items()}, {f"{a}-{b_}": round(v, 4) for (a, b_), v in O.items()},
-                  clusters, cands, dropped,
-                  {"setup": round(t_setup - t0, 2), "insertion": round(t_gen - t_setup, 2),
-                   "shortest_path_feeders": round(t_sp - t_gen, 2), "cover_cycle": round(t_fin - t_sp, 2)},
+                  clusters, cands, dropped, seconds,
                   {"/".join(k): v for k, v in sorted(b.reasons.items())},
-                  {"/".join(k): v for k, v in sorted(b.reason_sets.items())})
+                  {"/".join(k): v for k, v in sorted(b.reason_sets.items())}, loop_stats, must_stats)
+
+
+SP_ORIGINS = ("shortest_path_feeder", "must_feeder")
 
 
 def pools(cands: list[Candidate], threshold: float) -> dict[str, tuple[list[Candidate], int]]:
-    """배분 후보 풀. ours = 생성 + 최단경로 피더(중복 제거), sp = 최단경로 피더만(중복 제거)."""
+    """배분 후보 풀. ours = 전체(중복 제거), sp = 최단경로 피더 + 필수 정류장 전용(순회형 버전 포함, 중복 제거)."""
     return {"ours": dedupe(cands, threshold),
-            "sp": dedupe([c for c in cands if c.origin == "shortest_path_feeder"], threshold)}
+            "sp": dedupe([c for c in cands if c.origin in SP_ORIGINS], threshold)}

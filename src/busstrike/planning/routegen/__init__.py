@@ -6,6 +6,9 @@
 - `graph`: 망(travel_times) 최단경로와 노선 지표(편도·우회율·정차 수)
 - `generate`: 허브 → 권역 → 겹침 병합 → 섹터 분할·최선 삽입·2-opt → 최단경로 피더 → 덮개·주기·중복 제거
 - `allocate`: 충족 근사 v2, CELF 탐욕 개설, 국소 탐색, 차량 합 = 가용 대수
+- `must_stops`(v2): 필수 시설 → 필수 정류장 규칙(묶음·시설 목록에서 그때그때 계산)
+- `loop`(v2): 순회형(기점 → 회차 → 기점) 노선 — 길 건너 짝, 오는 쪽 수요 끼우기, 방향별 제약
+- v2 배분: 필수 정류장 시간당 운행 제약(`allocate.Model(must=...)`). 설계: docs/design/routegen-v2.md
 
 주기와 공차 복귀는 시뮬레이터(`busstrike.sim.timetable.route_period`)와 비교 입력 변환기
 (`busstrike.sim.adapters.comparison_plan.to_engine_plan`)를 불러서 구한다. 같은 식을 여기서 다시 짜지 않는다.

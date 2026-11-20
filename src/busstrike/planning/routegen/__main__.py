@@ -14,12 +14,23 @@
 - manifest.json: 안별 배분·근사 충족(κ=1)·초기해별 국소 탐색 결과·이동 종류별 시도/수락·파라미터·코드 커밋
 
 배분 순서: 피더안(sp 풀)을 먼저 배분하고, 그 배분을 우리 안(ours 풀) 초기해 하나로 넣는다.
-그래서 같은 후보 풀에서 우리 안의 근사 ≥ 피더안의 근사다(아니면 멈춘다).
+그래서 같은 후보 풀에서 우리 안의 근사 ≥ 피더안의 근사다(아니면 멈춘다). 필수 정류장이 있으면 비교는
+사전식 (덮은 필수 정류장 수, 근사)다.
+
+프로필(설계 v2 5절; 명시한 인자가 프로필 값보다 앞선다)
+- `--profile v1`: 순회형 끔, 필수 정류장 끔, 고정 한도(편도 20·30분, 정차 8) → 기존 v1과 바이트 단위로 같은 plan.json.
+- `--profile v2`(기본): 순회형 켬, 필수 정류장 켬(`--facilities` 필요), 길이 규칙 N=2, 정차 상한 없음, 우회율 1.6.
+
+v2 추가 출력
+- plans/<plan_id>.plan_report.json: 노선별 형태(편도/순회형)·시간당 운행, 필수 정류장별 덮는 노선·시간당 운행,
+  must_stop_infeasible과 정류장 목록, 설정 전체와 해시, 코드 커밋. plan.json 형식은 바꾸지 않는다.
+- must_stops/: 이 묶음의 필수 정류장 계산 결과(`must_stops.for_bundle`).
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -32,6 +43,7 @@ from busstrike.sim import io as sio
 from . import allocate as A
 from . import data as D
 from . import generate as G
+from . import must_stops as MS
 
 PLAN_LABELS = {"ours": "01", "sp": "02"}   # plan_id에 출처를 드러내지 않는다(schema.md §1)
 
@@ -53,6 +65,32 @@ def _opt_int(text: str) -> int | None:
     return None if text.lower() in ("none", "inf", "0") else int(text)
 
 
+UNSET = object()   # 프로필 값으로 채울 인자의 기본값(문자열이 아니어야 argparse가 type으로 바꾸지 않는다)
+
+# 프로필 기본값. UNSET인 인자만 프로필 값으로 채운다.
+PROFILES: dict[str, dict] = {
+    "v1": {"loops": False, "must_stops": False, "length_n": None, "l_max": (20, 30), "max_stops": 8,
+           "max_detour": 1.6, "endpoints": "all"},
+    "v2": {"loops": True, "must_stops": True, "length_n": 2, "l_max": (20, 30), "max_stops": None,
+           "max_detour": 1.6, "endpoints": "all"},
+}
+
+
+def _gtfs_depots(root: Path) -> frozenset[str]:
+    """기점 후보 = 묶음 GTFS 운행편마다 첫 정류장(stop_sequence 최소)."""
+    first: dict[str, tuple[int, str]] = {}
+    for r in D._read_csv(root / "gtfs" / "stop_times.txt"):
+        seq = int(r["stop_sequence"])
+        cur = first.get(r["trip_id"])
+        if cur is None or seq < cur[0]:
+            first[r["trip_id"]] = (seq, r["stop_id"])
+    return frozenset(s for _, s in first.values())
+
+
+def _sha(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, ensure_ascii=False, sort_keys=True, default=list).encode()).hexdigest()
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m busstrike.planning.routegen")
     ap.add_argument("--root", required=True, type=Path, help="구 실험 묶음 폴더(README.md, network/, demand/, bundles/)")
@@ -65,15 +103,43 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tau-step", type=float, default=d.tau_step)
     ap.add_argument("--radius-m", type=float, default=d.radius_m)
     ap.add_argument("--c0-min", type=int, default=d.c0_s // 60)
-    ap.add_argument("--l-max", type=_ints, default=d.l_max_min)
+    ap.add_argument("--l-max", type=_ints, default=UNSET, help="편도 상한(분) 목록. 기본: 프로필(20,30)")
     ap.add_argument("--sectors", type=_ints, default=d.sectors)
-    ap.add_argument("--max-stops", type=_opt_int, default=d.max_stops, help="N_max. none = 검사하지 않음")
-    ap.add_argument("--max-detour", type=float, default=d.max_detour)
+    ap.add_argument("--max-stops", type=_opt_int, default=UNSET,
+                    help="N_max(순회형은 방향마다). none = 검사하지 않음. 기본: 프로필(v1 8, v2 none)")
+    ap.add_argument("--max-detour", type=float, default=UNSET, help="우회율 상한. 기본: 프로필(1.6)")
     ap.add_argument("--sp-top", type=int, default=d.sp_top)
     ap.add_argument("--jaccard", type=float, default=d.jaccard)
     ap.add_argument("--revision", type=int, default=1)
     ap.add_argument("--condition", default="base", help="실행 조건 이름(manifest에 적는다)")
+    # v2
+    ap.add_argument("--profile", choices=sorted(PROFILES), default="v2")
+    ap.add_argument("--loops", action=argparse.BooleanOptionalAction, default=UNSET, help="순회형 후보(기본: 프로필)")
+    ap.add_argument("--must-stops", action=argparse.BooleanOptionalAction, default=UNSET,
+                    help="필수 정류장 후보·배분 제약(기본: 프로필)")
+    ap.add_argument("--length-n", type=_opt_int, default=UNSET,
+                    help="길이 규칙 N(운행 창 안에 N회). none = 편도 --l-max 고정 한도. 기본: 프로필(v1 none, v2 2)")
+    ap.add_argument("--endpoints", choices=G.ENDPOINT_MODES, default=UNSET, help="끝점 후보 집합. 기본: 프로필(all)")
+    ap.add_argument("--facilities", type=Path, default=None, help="facilities_seoul.csv(저장소 밖)")
+    ap.add_argument("--must-radius-m", type=float, default=MS.MustConfig.radius_m)
+    ap.add_argument("--must-kinds", default=None, help="쉼표 목록(kind 또는 type). 기본: 전부")
+    ap.add_argument("--must-no-gg", action="store_true", help="필수 정류장 판정에서 경기 노선을 계속 운행으로 보지 않는다")
+    ap.add_argument("--must-max-wait-min", type=int, default=20, help="필수 정류장 대기 한도(분) → 시간당 60/W회")
+    ap.add_argument("--must-insert-radius-m", type=float, default=d.must_insert_radius_m)
+    ap.add_argument("--pair-radius-m", type=float, default=d.pair_radius_m, help="길 건너 짝 거리(이름 같음). 기본 50")
+    ap.add_argument("--return-detour", type=float, default=None, help="순회형 오는 쪽 우회율 상한. 기본: --max-detour")
+    ap.add_argument("--shapes", choices=("both", "loop"), default="both",
+                    help="배분 후보 형태. both = 편도·순회형 중 배분이 고름(기본), loop = 순회형만")
+    ap.add_argument("--od-csv", type=Path, default=None,
+                    help="정류장 → 정류장 수요(date,hour,origin_stop,dest_stop,flow). 주면 demand_flows 대신 쓴다")
+    ap.add_argument("--scenario-variant", default="affected", help="--od-csv일 때 시나리오를 읽을 묶음 변형")
     args = ap.parse_args(argv)
+    prof = PROFILES[args.profile]
+    for k in ("loops", "must_stops", "endpoints", "length_n", "l_max", "max_stops", "max_detour"):
+        if getattr(args, k) is UNSET:
+            setattr(args, k, prof[k])
+    if args.must_stops and args.facilities is None:
+        raise SystemExit("필수 정류장이 켜져 있다(--profile v2) — --facilities <facilities_seoul.csv>를 주거나 --no-must-stops")
 
     root, out = args.root.resolve(), args.out.resolve()
     root_check = D.check_root(root, "exp")
@@ -89,18 +155,43 @@ def main(argv: list[str] | None = None) -> int:
     started = time.time()
 
     net = D.load_network(root)
-    rows = D.load_flows(root)
-    check = D.check_bundles(root, rows, args.fleets[0])
+    if args.od_csv is None:
+        rows = D.load_flows(root)
+        check = D.check_bundles(root, rows, args.fleets[0])
+    else:
+        rows, check = None, [{"skipped": "od-csv", "od_csv": str(args.od_csv)}]
     (out / "bundle_check.json").write_text(json.dumps(check, ensure_ascii=False, indent=1), encoding="utf-8")
-    bad = [c["bundle"] for c in check if not c["match"]]
+    bad = [c["bundle"] for c in check if not c.get("match", True)]
     if bad:
         print(f"잔여 수요가 묶음 demand_bins.csv와 다르다: {bad}", file=sys.stderr)
         return 1
 
+    must_res = None
+    must_list: tuple[str, ...] = ()
+    if args.must_stops:
+        mcfg = MS.MustConfig(args.must_radius_m, tuple(args.must_kinds.split(",")) if args.must_kinds else None,
+                             not args.must_no_gg)
+        must_res = MS.for_bundle(args.facilities, root, home_gu, mcfg)
+        MS.write(out / "must_stops", must_res)
+        must_list = tuple(must_res["must_stops"])
+    depots = _gtfs_depots(root) if args.endpoints == "stations+depots" else frozenset()
+
     params = G.Params(c0_s=args.c0_min * 60, radius_m=args.radius_m, tau=args.tau, tau_step=args.tau_step,
                       sectors=args.sectors, l_max_min=args.l_max, max_stops=args.max_stops,
-                      max_detour=args.max_detour, sp_top=args.sp_top, jaccard=args.jaccard, home_gu=home_gu)
+                      max_detour=args.max_detour, sp_top=args.sp_top, jaccard=args.jaccard, home_gu=home_gu,
+                      loops=args.loops, length_n=args.length_n, endpoints=args.endpoints, must_stops=must_list,
+                      must_insert_radius_m=args.must_insert_radius_m, pair_radius_m=args.pair_radius_m,
+                      return_detour=args.return_detour)
     ap_ = A.AllocParams()
+    settings = {"profile": args.profile, "params": asdict(params) | {"f_min": params.f_min},
+                "alloc_params": asdict(ap_), "must_max_wait_s": args.must_max_wait_min * 60,
+                "must_config": must_res["config"] if must_res else None,
+                "facilities": str(args.facilities) if args.facilities else None,
+                "facilities_sha256": sio.sha256_file(args.facilities) if args.facilities else None,
+                "od_csv": str(args.od_csv) if args.od_csv else None, "fleets": list(args.fleets),
+                "shapes": args.shapes,
+                "variants": args.variants, "root": str(root), "network_snapshot_id": net.tt.network_snapshot_id}
+    settings_sha = _sha(settings)
     manifest = {"condition": args.condition, "fleets": list(args.fleets), "root_check": root_check, "root": str(root), "readme_title": (root / "README.md").read_text(encoding="utf-8").splitlines()[0],
                 "network_snapshot_id": net.tt.network_snapshot_id,
                 "commit": _git("rev-parse", "HEAD"),
@@ -109,17 +200,32 @@ def main(argv: list[str] | None = None) -> int:
                 "code_sha256": {p.name: sio.sha256_file(p) for p in sorted(Path(__file__).resolve().parent.glob("*.py"))},
                 "python": sys.version.split()[0],
                 "params": asdict(params) | {"f_min": params.f_min}, "alloc_params": asdict(ap_),
-                "bundle_check": {"bundles": len(check), "all_match": not bad}, "variants": {}, "plans": []}
+                "bundle_check": {"bundles": len(check), "all_match": not bad}, "variants": {}, "plans": [],
+                "profile": args.profile, "settings_sha256": settings_sha,
+                "must_stops": ({"stops": list(must_list), "counts": must_res["counts"], "gu_code": must_res["gu_code"]}
+                               if must_res else None)}
 
-    for variant in args.variants.split(","):
+    variants = args.variants.split(",") if args.od_csv is None else ["od"]
+    od_rows = D.load_od_csv(args.od_csv) if args.od_csv else None
+    for variant in variants:
         t0 = time.time()
-        demand = D.build_demand(rows, variant)
-        scen = {f: D.read_scenario(root / "bundles" / f"{variant}_{demand.dates[0]}", f) for f in args.fleets}
+        if od_rows is None:
+            demand = D.build_demand(rows, variant)
+            sv = variant
+        else:
+            demand = D.build_demand_od(od_rows, net)
+            sv = args.scenario_variant
+        scen = {f: D.read_scenario(root / "bundles" / f"{sv}_{D.EXPECTED_DATES[0] if od_rows else demand.dates[0]}", f)
+                for f in args.fleets}
         scen0 = scen[args.fleets[0]]
         policy = scen0.policy
         if policy.max_wait_s != ap_.wait_s or any(v.capacity != ap_.seat for v in scen0.vehicles):
             raise SystemExit("시나리오 정책(대기 한도·좌석)이 배분 파라미터와 다르다")
-        res = G.generate(net, demand, scen0, params)
+        res = G.generate(net, demand, scen0, params, depots)
+        if args.shapes == "loop":
+            if not params.loops:
+                raise SystemExit("--shapes loop에는 순회형 후보가 필요하다(--loops)")
+            res.candidates = [c for c in res.candidates if c.shape == "loop"]
         pools = G.pools(res.candidates, params.jaccard)
         t_gen = time.time() - t0
         vinfo = {
@@ -132,6 +238,10 @@ def main(argv: list[str] | None = None) -> int:
             "candidates": len(res.candidates),
             "by_origin_kind": {}, "pools": {k: {"kept": len(v[0]), "removed_jaccard": v[1]} for k, v in pools.items()},
         }
+        if params.loops or params.must_stops:
+            vinfo["loop_stats"] = res.loop_stats
+            vinfo["must_stats"] = res.must_stats
+            vinfo["by_shape"] = {sh: sum(1 for c in res.candidates if c.shape == sh) for sh in ("oneway", "loop")}
         for c in res.candidates:
             key = f"{c.origin}/{c.kind}"
             vinfo["by_origin_kind"][key] = vinfo["by_origin_kind"].get(key, 0) + 1
@@ -148,7 +258,12 @@ def main(argv: list[str] | None = None) -> int:
         ours_pool = sorted(pools["ours"][0] + added, key=lambda c: c.route_id)
         sp_to_ours = {c.route_id: ours_by_stops.get(c.stops, c.route_id) for c in pools["sp"][0]}
         vinfo["sp_routes_added_to_ours"] = [c.route_id for c in added]
-        models = {lab: A.Model([(c.route_id, c.cycle_s, c.cover_keys) for c in pool], demand.od, ap_)
+        def _must_of(pool):
+            if not must_list:
+                return None
+            return {s: tuple(c.route_id for c in pool if s in c.must) for s in must_list}
+        models = {lab: A.Model([(c.route_id, c.cycle_s, c.cover_keys) for c in pool], demand.od, ap_,
+                               _must_of(pool), args.must_max_wait_min * 60 if must_list else None)
                   for lab, pool in (("sp", pools["sp"][0]), ("ours", ours_pool))}
         for fleet in args.fleets:
             allocs = {}
@@ -160,7 +275,8 @@ def main(argv: list[str] | None = None) -> int:
                 t1 = time.time()
                 alloc = allocs[label] = A.allocate(model, fleet, starts)
                 vinfo["alloc_seconds"][f"{label}_f{fleet}"] = round(time.time() - t1, 2)
-                if label == "ours" and alloc["value"] < allocs["sp"]["value"] - 1e-6:
+                if label == "ours" and (model.covered(alloc["n"]), alloc["value"]) < (
+                        models["sp"].covered(allocs["sp"]["n"]), allocs["sp"]["value"] - 1e-6):
                     raise SystemExit(f"{variant} f{fleet}: 우리 안 근사 {alloc['value']:.3f} < 피더안 {allocs['sp']['value']:.3f}")
                 det = model.detail(alloc["n"])
                 plan_id = f"plan-{PLAN_LABELS[label]}-{variant}-f{fleet}"
@@ -191,6 +307,39 @@ def main(argv: list[str] | None = None) -> int:
                                for k, v in alloc["inits"].items()},
                     "pool_size": len(model.ids),
                     "demand_total_5day_avg": round(demand.total(), 4)})
+                rep_routes = {}
+                for rid, cid in route_map.items():
+                    c = by_id[cid]
+                    rep_routes[rid] = {"candidate": cid, "shape": c.shape, "kind": c.kind, "origin": c.origin,
+                                       "vehicles": alloc["n"][cid], "cycle_s": c.cycle_s,
+                                       "trips_per_hour": round(alloc["n"][cid] * 3600 / c.cycle_s, 4),
+                                       "headway_s": round(c.cycle_s / alloc["n"][cid], 1),
+                                       "n_stops": len(c.stops), "turn": c.turn, "detour": round(c.detour, 4),
+                                       "must": list(c.must), "loop": c.loop_info}
+                must_rep = {"enabled": False}
+                if alloc.get("must"):
+                    inv = {cid: rid for rid, cid in route_map.items()}
+                    m = alloc["must"]
+                    must_rep = {"enabled": True, "must_wait_s": m["must_wait_s"],
+                                "need_trips_per_hour": m["need_trips_per_hour"],
+                                "start_vehicles": m["start_vehicles"],
+                                "stops": {s: dict(v, routes=[inv[r] for r in v["routes"]]) for s, v in m["stops"].items()},
+                                "must_stop_infeasible": m["must_stop_infeasible"], "infeasible": m["infeasible"],
+                                "milp": "없음(표준 라이브러리만, 솔버 미설치)"}
+                report = {"plan_id": plan_id, "label": label, "variant": variant, "fleet": fleet,
+                          "plan_sha256": sio.sha256_file(path), "profile": args.profile,
+                          "shape_counts": {sh: sum(1 for r in rep_routes.values() if r["shape"] == sh)
+                                           for sh in ("oneway", "loop")},
+                          "routes": rep_routes, "must": must_rep,
+                          "approx_served": round(det["total"], 4),
+                          "settings": settings, "settings_sha256": settings_sha,
+                          "commit": manifest["commit"], "branch": manifest["branch"],
+                          "tracked_changes": manifest["tracked_changes"], "code_sha256": manifest["code_sha256"]}
+                (out / "plans" / f"{plan_id}.plan_report.json").write_text(
+                    json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+                manifest["plans"][-1]["plan_report"] = str(out / "plans" / f"{plan_id}.plan_report.json")
+                if alloc.get("must"):
+                    manifest["plans"][-1]["must_stop_infeasible"] = alloc["must"]["must_stop_infeasible"]
         manifest["variants"][variant] = vinfo
         print(f"{variant}: 허브 {len(res.hubs)} · 군집 {len(res.clusters)} · 후보 {len(res.candidates)} "
               f"(ours {len(pools['ours'][0])}, sp {len(pools['sp'][0])}) · {time.time() - t0:.1f}s", flush=True)
