@@ -13,6 +13,7 @@ from pathlib import Path
 from busstrike.planning.routegen import allocate as A
 from busstrike.planning.routegen import generate as G
 from busstrike.planning.routegen import must_stops as MS
+from busstrike.planning.routegen import strike as K
 from busstrike.planning.routegen.cycle import route_cycle, single_route_plan
 from busstrike.planning.routegen.data import Demand, Network, Station, Stop
 from busstrike.planning.routegen.graph import Graph
@@ -435,3 +436,69 @@ class RoadNetworkTest(unittest.TestCase):
         from busstrike.planning.routegen.data import load_network
         with self.assertRaises(ValueError):
             load_network(root, road)
+
+
+# ---------------------------------------------------------------- 파업 시나리오 수요(strike.py)
+
+class StrikeScenarioTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = self.root = must_bundle(Path(self.tmp.name))
+        # R1(affected): 116000001 → 116000002, R3(affected): 116000004 → 116000002, R2(unaffected): 116000003만
+        _write(root / "gtfs" / "routes.txt", ["route_id", "route_short_name", "route_type"],
+               [["R1", "1", 3], ["R2", "2", 3], ["R3", "3", 3]])
+        _write(root / "gtfs" / "trips.txt", ["route_id", "service_id", "trip_id"],
+               [["R1", "W", "t1"], ["R2", "W", "t2"], ["R3", "W", "t3"]])
+        _write(root / "gtfs" / "stop_times.txt", ["trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"],
+               [["t1", "07:00:00", "07:00:00", "116000001", 1], ["t1", "07:05:00", "07:05:00", "116000002", 2],
+                ["t2", "07:00:00", "07:00:00", "116000003", 1], ["t2", "07:05:00", "07:05:00", "116000002", 2],
+                ["t3", "07:00:00", "07:00:00", "116000004", 1], ["t3", "07:05:00", "07:05:00", "116000002", 2]])
+        _write(root / "registry" / "strike_route_registry.csv", ["route_id", "strike_state"],
+               [["R1", "affected"], ["R2", "unaffected"], ["R3", "affected"]])
+        import gzip as _gz
+        (root / "demand").mkdir(parents=True, exist_ok=True)
+        head = "date,hour,kind,stop_id,station_id,station_stop_id,source,flow_total,flow,flow_unknown,walkable,maeul_reach,gg_reach\n"
+        body = ("20261026,7,access,116000001,K,116000002,observed,10,8,0,False,False,False\n"
+                "20261026,7,access,116000003,K,116000002,observed,10,6,0,False,False,False\n"
+                "20261026,7,access,116000004,K,116000002,observed,10,4,0,False,False,True\n"
+                "20261026,7,access,116000005,K,116000002,observed,10,5,0,True,False,False\n")
+        with _gz.open(root / "demand" / "demand_flows.csv.gz", "wt", encoding="utf-8") as f:
+            f.write(head + body)
+        with _gz.open(root / "demand" / "stop_route_boardings.csv.gz", "wt", encoding="utf-8") as f:
+            f.write("date,hour,stop_id,route_id,boardings,strike_state\n"
+                    "20261026,7,116000001,R1,30,affected\n20261026,7,116000001,R3,10,affected\n")
+
+    def test_draw_is_deterministic_and_sized(self):
+        a, b = K.draw_strike(self.root, 0.5, 3), K.draw_strike(self.root, 0.5, 3)
+        self.assertEqual(a.routes, b.routes)
+        self.assertEqual(len(a.routes), 1)                       # round(0.5 × 2)
+        self.assertEqual(K.draw_strike(self.root, 1.0, 0).routes, {"R1", "R3"})
+        self.assertEqual(K.draw_strike(self.root, 0.0, 0).routes, frozenset())
+
+    def test_reach_index_order(self):
+        r = K.ReachIndex(self.root)
+        self.assertEqual(r.routes("116000001", "116000002"), {"R1"})
+        self.assertEqual(r.routes("116000002", "116000001"), frozenset())
+
+    def test_full_strike_share_and_absorption(self):
+        rows, st = K.scenario_rows(self.root, K.draw_strike(self.root, 1.0, 0))
+        got = {(x.origin_stop, x.dest_stop): x.flow for x in rows}
+        self.assertEqual(got[("116000001", "116000002")], 8.0)     # frac 1, 운행 노선 없음
+        self.assertNotIn(("116000003", "116000002"), got)          # R2(파업 안 함)가 간다 → 흡수
+        self.assertNotIn(("116000004", "116000002"), got)          # 경기버스가 닿음 → 흡수
+        self.assertEqual(st["flow_bundle"], 18.0)                  # 걸어서 못 가는 행의 flow 합(걸어서 가는 행 제외)
+
+    def test_partial_strike_uses_boarding_share_and_running_routes(self):
+        only_r1 = K.StrikeSet(frozenset({"R1"}), ("R1", "R3"), 0.5)
+        rows, _ = K.scenario_rows(self.root, only_r1)
+        got = {(x.origin_stop, x.dest_stop): x.flow for x in rows}
+        self.assertEqual(got[("116000001", "116000002")], 8 * 30 / 40)   # R1 승차 몫, R3는 이 정류장 → 역을 안 간다
+        only_r3 = K.StrikeSet(frozenset({"R3"}), ("R1", "R3"), 0.5)
+        rows, st = K.scenario_rows(self.root, only_r3)
+        self.assertNotIn(("116000001", "116000002"), {(x.origin_stop, x.dest_stop) for x in rows})   # R1이 계속 운행 → 흡수
+        self.assertEqual(st["flow_strike_share"], 8 * 10 / 40 + 6 * 0.5 + 4 * 0.5)   # 승차 기록 없는 칸은 |S|/|후보|
+
+    def test_control_uses_all_bus_passengers_without_absorption(self):
+        rows, st = K.scenario_rows(self.root, None, "all")
+        self.assertEqual(st["flow_out"], 30.0)

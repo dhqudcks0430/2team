@@ -71,6 +71,7 @@ class Params:
     close_max_s: int | None = None   # 순회형 닫는 공차(끝 → 기점) 상한(초). None = 없음
     loop_only: bool = False          # 결과 후보를 순회형만 남긴다(편도는 순회형을 만드는 출발점으로만 쓴다)
     loop_max_detour: float | None = None   # 순회형 우회율 상한(None = max_detour). 망 경로로 재므로 지자체 고리도 크게 나온다
+    hub_min_count: int = 0           # 허브 최소 개수(F_min을 넘는 역이 적으면 F 큰 역부터 채움). 0 = v1 동작
     loop_insert_top: int = 30        # 순회형 오는 쪽에 끼울 수요 정류장 후보 수(값 큰 순)
 
     @property
@@ -143,10 +144,20 @@ def cover_value(stops: tuple[str, ...], od_total: dict[tuple[str, str], float]) 
 # ---------------------------------------------------------------- 1~3 허브·권역·병합
 
 def hubs_of(demand: Demand, net: Network, p: Params) -> dict[str, float]:
+    """허브 = F_k ≥ F_min인 역. hub_min_count개보다 적으면 F가 큰 역부터 hub_min_count개까지 채운다(v2).
+
+    F_min은 절대값(차량 2대를 채울 수요)이라 부분 파업처럼 수요가 적으면 허브가 거의 없어 후보를 못 만든다.
+    """
     F = demand.station_total()
-    return {k: F[k] for k in sorted(F)
-            if F[k] >= p.f_min and k in net.stations
-            and (net.stations[k].access_stop or net.stations[k].egress_stop)}
+    ok = [k for k in sorted(F) if F[k] > 0 and k in net.stations
+          and (net.stations[k].access_stop or net.stations[k].egress_stop)]
+    hubs = {k: F[k] for k in ok if F[k] >= p.f_min}
+    if len(hubs) < p.hub_min_count:
+        for k in sorted(ok, key=lambda x: (-F[x], x)):
+            if len(hubs) >= p.hub_min_count:
+                break
+            hubs.setdefault(k, F[k])
+    return dict(sorted(hubs.items()))
 
 
 def catchments(demand: Demand, net: Network, hubs: dict[str, float], p: Params) -> dict[str, dict[str, float]]:

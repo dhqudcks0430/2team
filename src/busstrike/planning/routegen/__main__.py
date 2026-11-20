@@ -47,6 +47,7 @@ from . import allocate as A
 from . import data as D
 from . import generate as G
 from . import must_stops as MS
+from . import strike as K
 
 PLAN_LABELS = {"ours": "01", "sp": "02"}   # plan_id에 출처를 드러내지 않는다(schema.md §1)
 
@@ -74,11 +75,11 @@ UNSET = object()   # 프로필 값으로 채울 인자의 기본값(문자열이
 PROFILES: dict[str, dict] = {
     "v1": {"loops": False, "must_stops": False, "length_n": None, "l_max": (20, 30), "max_stops": 8,
            "max_detour": 1.6, "endpoints": "all", "pair_radius_m": 50.0, "loop_detour": "direction",
-           "close_max_s": None},
+           "close_max_s": None, "hub_min_count": 0},
     # v2: 순환 운행만. 짝 100m·고리 전체 우회율은 지자체 셔틀안(2026-01, 25개 구) 모양을 근거로 정했다(설계 문서 7절).
     "v2": {"loops": True, "must_stops": True, "length_n": 2, "l_max": (20, 30), "max_stops": None,
            "max_detour": 1.6, "endpoints": "all", "pair_radius_m": 100.0, "loop_detour": "loop_total",
-           "close_max_s": 300},
+           "close_max_s": 300, "hub_min_count": 3},
 }
 
 
@@ -135,6 +136,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pair-radius-m", type=float, default=UNSET, help="길 건너 짝 거리(이름 같음). 기본: 프로필(v2 100)")
     ap.add_argument("--return-detour", type=float, default=None,
                     help="순회형 오는 쪽 우회율 상한(--loop-detour direction일 때만). 기본: --max-detour")
+    ap.add_argument("--hub-min-count", type=int, default=UNSET,
+                    help="허브 최소 개수(F_min 넘는 역이 적으면 수요 큰 역부터 채움). 기본: 프로필(v1 0, v2 3)")
     ap.add_argument("--loop-max-detour", type=float, default=None,
                     help="순회형 우회율 상한(망 경로 기준). 기본: --max-detour(1.6)")
     ap.add_argument("--loop-detour", choices=("direction", "loop_total"), default=UNSET,
@@ -146,10 +149,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--od-csv", type=Path, default=None,
                     help="정류장 → 정류장 수요(date,hour,origin_stop,dest_stop,flow). 주면 demand_flows 대신 쓴다")
     ap.add_argument("--scenario-variant", default="affected", help="--od-csv일 때 시나리오를 읽을 묶음 변형")
+    ap.add_argument("--strike-rate", type=float, default=None,
+                    help="파업 비율 0~1(등록부 affected 노선 중 무작위). 주면 그 파업의 셔틀 대상 수요로 만든다(strike.py)")
+    ap.add_argument("--strike-draw", type=int, default=0, help="같은 파업 비율의 무작위 뽑기 번호")
+    ap.add_argument("--strike-seed", type=int, default=20261121)
+    ap.add_argument("--demand-mode", choices=("strike", "all"), default=None,
+                    help="all = 대조군(파업 없음, 걸어서 못 가는 모든 버스 승객). strike = --strike-rate의 파업")
     args = ap.parse_args(argv)
     prof = PROFILES[args.profile]
     for k in ("loops", "must_stops", "endpoints", "length_n", "l_max", "max_stops", "max_detour", "pair_radius_m",
-              "loop_detour", "close_max_s"):
+              "loop_detour", "close_max_s", "hub_min_count"):
         if getattr(args, k) is UNSET:
             setattr(args, k, prof[k])
     if args.profile == "v2" and args.network_dir is None:
@@ -176,6 +185,17 @@ def main(argv: list[str] | None = None) -> int:
     started = time.time()
 
     net = D.load_network(root, args.network_dir)
+    strike_info = None
+    if args.strike_rate is not None or args.demand_mode is not None:
+        mode = args.demand_mode or "strike"
+        st = K.draw_strike(root, args.strike_rate, args.strike_draw, args.strike_seed) if mode == "strike" else None
+        rows_od, kst = K.scenario_rows(root, st, mode)
+        args.od_csv = out / "scenario_od.csv"
+        K.write_od_csv(args.od_csv, rows_od)
+        strike_info = {"mode": mode, "rate": st.rate if st else 0.0, "draw": st.draw if st else None,
+                       "seed": st.seed if st else None, "routes": sorted(st.routes) if st else [],
+                       "eligible": len(st.eligible) if st else None, "stats": kst}
+        (out / "strike.json").write_text(json.dumps(strike_info, ensure_ascii=False, indent=1), encoding="utf-8")
     if args.od_csv is None:
         rows = D.load_flows(root)
         check = D.check_bundles(root, rows, args.fleets[0])
@@ -192,7 +212,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.must_stops:
         mcfg = MS.MustConfig(args.must_radius_m, tuple(args.must_kinds.split(",")) if args.must_kinds else None,
                              not args.must_no_gg)
-        must_res = MS.for_bundle(args.facilities, root, home_gu, mcfg)
+        override = None
+        if strike_info is not None:                    # 이 파업에서 계속 운행하는 노선으로 필수 정류장을 다시 판정
+            override = set(strike_info["routes"])
+        must_res = MS.for_bundle(args.facilities, root, home_gu, mcfg, override)
         MS.write(out / "must_stops", must_res)
         must_list = tuple(must_res["must_stops"])
     depots = _gtfs_depots(root) if args.endpoints == "stations+depots" else frozenset()
@@ -203,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
                       loops=args.loops, length_n=args.length_n, endpoints=args.endpoints, must_stops=must_list,
                       must_insert_radius_m=args.must_insert_radius_m, pair_radius_m=args.pair_radius_m,
                       return_detour=args.return_detour, loop_detour=args.loop_detour, close_max_s=args.close_max_s,
-                      loop_only=args.loops, loop_max_detour=args.loop_max_detour)
+                      loop_only=args.loops, loop_max_detour=args.loop_max_detour, hub_min_count=args.hub_min_count)
     ap_ = A.AllocParams()
     settings = {"profile": args.profile, "params": asdict(params) | {"f_min": params.f_min},
                 "alloc_params": asdict(ap_), "must_max_wait_s": args.must_max_wait_min * 60,
@@ -217,7 +240,8 @@ def main(argv: list[str] | None = None) -> int:
                 "turns_sha256": (sio.sha256_file(args.network_dir / "turns.json")
                                  if args.network_dir and (args.network_dir / "turns.json").exists() else None),
                 "loop_only": params.loop_only,
-                "variants": args.variants, "root": str(root), "network_snapshot_id": net.tt.network_snapshot_id}
+                "variants": args.variants, "root": str(root), "network_snapshot_id": net.tt.network_snapshot_id,
+                "strike": ({k: v for k, v in strike_info.items() if k != "stats"} if strike_info else None)}
     settings_sha = _sha(settings)
     manifest = {"condition": args.condition, "fleets": list(args.fleets), "root_check": root_check, "root": str(root), "readme_title": (root / "README.md").read_text(encoding="utf-8").splitlines()[0],
                 "network_snapshot_id": net.tt.network_snapshot_id,
@@ -242,7 +266,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             demand = D.build_demand_od(od_rows, net)
             sv = args.scenario_variant
-        scen = {f: D.read_scenario(root / "bundles" / f"{sv}_{D.EXPECTED_DATES[0] if od_rows else demand.dates[0]}", f)
+        bdir = root / "bundles" / f"{sv}_{D.EXPECTED_DATES[0] if od_rows else demand.dates[0]}"
+        have = sorted(int(x.stem.split("_f")[1]) for x in bdir.glob("scenario_f*.json"))
+        # 묶음에 없는 대수(비례 대수 등)는 정책·운행 창이 같은 가장 가까운 대수 시나리오를 쓴다(생성기는 정책·창만 쓴다)
+        scen = {f: D.read_scenario(bdir, f if f in have else min(have, key=lambda h: (abs(h - f), h)))
                 for f in args.fleets}
         scen0 = scen[args.fleets[0]]
         policy = scen0.policy
@@ -294,8 +321,15 @@ def main(argv: list[str] | None = None) -> int:
                 model = models[label]
                 starts = None
                 if label == "ours":
-                    starts = {"sp_plan": {sp_to_ours[r]: k for r, k in allocs["sp"]["n"].items()}}
+                    starts = ({"sp_plan": {sp_to_ours[r]: k for r, k in allocs["sp"]["n"].items()}}
+                              if allocs["sp"]["n"] else None)
                 t1 = time.time()
+                if not model.ids:                          # 후보가 하나도 없다: 노선안 없음으로 기록하고 넘어간다
+                    allocs[label] = {"n": {}, "value": 0.0}
+                    manifest["plans"].append({"plan_id": None, "label": label, "variant": variant, "fleet": fleet,
+                                              "no_candidates": True, "file": None})
+                    print(f"  {label} f{fleet}: 후보 없음 — 노선안을 만들지 않는다", flush=True)
+                    continue
                 alloc = allocs[label] = A.allocate(model, fleet, starts)
                 vinfo["alloc_seconds"][f"{label}_f{fleet}"] = round(time.time() - t1, 2)
                 if label == "ours" and (model.covered(alloc["n"]), alloc["value"]) < (
@@ -369,6 +403,8 @@ def main(argv: list[str] | None = None) -> int:
     manifest["wall_seconds"] = round(time.time() - started, 2)
     (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
     for p in manifest["plans"]:
+        if p.get("no_candidates"):
+            continue
         print(f"  {p['plan_id']}: 노선 {len(p['routes'])} · 대수 "
               f"{'/'.join(str(r['vehicles']) for r in p['routes'].values())} · 근사 충족 {p['approx_served']:.1f}")
     return 0
