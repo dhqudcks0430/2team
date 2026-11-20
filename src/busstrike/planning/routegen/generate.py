@@ -17,10 +17,11 @@ v2(설정으로 켠다. 기본값은 모두 v1과 같은 동작 — `--profile v
   셔틀은 순환 운행만 한다(편도 + 빈 차 복귀는 없다) — v2 프로필은 늘 켠다.
 - length_n: 길이 상한 = 운행 창 안에 N회 이상 돌 수 있는 길이. 생성 중에는 영업 시간 ≤ 창/N − 회차,
   마지막에 시뮬레이터 주기 ≤ 창/N. 주면 l_max_min(편도 20·30분) 대신 쓴다.
-- must_stops: 필수 정류장(`must_stops`)마다 ① 우회율 한도 안에서 기존 후보에 끼운 버전(origin must_insert),
-  ② 필수 정류장 → 가까운 역 access 정류장 전용 편도·순회형(origin must_feeder, 피더안 풀에도 넣는다).
-  전용 후보의 역 = 직선거리로 가까운 must_feeder_stations개 중 망 최단 시간이 가장 짧은 역(동률이면 직선거리·역 ID).
-  변환기를 못 지나는 역(역 → 필수 정류장 공차 경로 없음, RETURN)은 건너뛰고 다음 역을 쓴다.
+- must_stops: 필수 정류장(`must_stops`)마다 ① 우회율 한도 안에서 가까운 기존 후보에 끼운 버전(origin must_insert),
+  ② 끼울 후보도 원래 지나는 후보도 없을 때만 전용 후보(origin must_feeder, 피더안 풀에도 넣는다): 가까운 역 egress
+  정류장 → 필수 정류장(회차) → 역 쪽 순환. 덮음 = 첫·끝이 아닌 정차로 지남(`Candidate.must`).
+  전용 후보의 역 = 직선거리로 가까운 순서로 must_feeder_stations개까지 시도(동률이면 역 ID). 경로가 없거나
+  변환기를 못 지나는(RETURN) 역은 건너뛴다.
   전용 후보는 우회율을 보지 않는다(길이 규칙·S2·정차 상한만). 필수 정류장은 대개 망에서 갈래가 하나뿐인 곳이라
   가까운 역까지도 망 경로가 직선의 3~20배다(v4 강서 실측).
 - endpoints: 노선 끝점(편도 첫·끝, 순회형 기점·회차)을 끝점 후보 집합 안으로 제한(all | stations | stations+depots).
@@ -471,7 +472,7 @@ def _finish(c: Candidate, b: Builder, scenario: Scenario, p: Params,
     c.cross_gu = any(net.stops[s].gu != p.home_gu for s in c.stops)
     if p.must_stops:
         must = set(p.must_stops)
-        c.must = tuple(s for s in c.stops if s in must)
+        c.must = tuple(s for s in c.stops[1:-1] if s in must)     # 덮음 = 첫·끝이 아닌 정차
     return None
 
 
@@ -612,42 +613,18 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
                 add(pat.kind, stops, "shortest_path_feeder", pat.hubs, cl_of[h], f"sp:{s}")
     t_sp = time.time()
 
-    # v2-a. 필수 정류장 전용 편도(필수 정류장 → 가까운 역 access 정류장)
     must_stats: dict = {}
     must = [m for m in sorted(set(p.must_stops))]
+    known = net.tt.stop_ids()
     if must:
-        known = net.tt.stop_ids()
         must_stats = {"must_stops": must, "not_in_network": [m for m in must if m not in known],
-                      "feeder": {}, "insert": {}}
-        stations = sorted((k for k, st in net.stations.items() if st.access_stop and st.access_stop in known))
-        lim_free = Limits(L_max_s, p.max_stops, float("inf"))
-        for m in must:
-            if m not in known:
-                continue
-            near = sorted(stations, key=lambda k: (net.station_stop_dist_m(k, m), k))[: p.must_feeder_stations]
-            ranked = []
-            for k in near:
-                hit = graph.tree(m).get(net.stations[k].access_stop)
-                if hit is not None:
-                    ranked.append((hit[0], net.station_stop_dist_m(k, m), k))
-            made = None
-            for _, _, k in sorted(ranked):
-                pat = Pattern("access", (k,), None, net.stations[k].access_stop,
-                              (net.stations[k].lat, net.stations[k].lon))
-                stops = b.route_of(pat, [m, net.stations[k].access_stop], lim_free, f"must_{tag_max}")
-                if stops is not None and route_cycle(stops, net.tt, scenario) is None:
-                    must_stats.setdefault("feeder_no_return", {}).setdefault(m, []).append(k)
-                    continue                                   # 역에서 필수 정류장으로 돌아올 망 경로가 없다(RETURN)
-                if stops is not None:
-                    add("access", stops, "must_feeder", (k,), cl_of.get(k), f"must:{m}")
-                    made = k
-                    break
-            must_stats["feeder"][m] = made
+                      "covered_by_existing": [], "insert": {}, "dedicated": {}}
     t_mf = time.time()
 
-    # v2-b. 순회형: 편도 후보마다(생성·피더·필수 전용) 순회형 버전
+    # v2-b. 순회형: 편도 후보마다(생성·피더) 순회형 버전
     loop_stats: dict = {}
     loop_cap = p.max_detour if p.loop_max_detour is None else p.loop_max_detour
+    maker = None
     if p.loops:
         maker = LoopMaker(net, graph, b.od_total, loop_cap, p.max_stops, L_max_s, p.pair_radius_m,
                           p.loop_insert_top, p.return_detour, p.loop_detour, p.close_max_s)
@@ -655,8 +632,7 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
             c = raw[key]
             if c.shape != "oneway":
                 continue
-            built = maker.build(c.stops, _reverse_pool(c.hubs, K, demand, p.loop_insert_top),
-                                detour_free=c.origin == "must_feeder")
+            built = maker.build(c.stops, _reverse_pool(c.hubs, K, demand, p.loop_insert_top))
             if built is None:
                 continue
             info = {"from": list(c.stops[:1]) + [c.stops[-1]], "targets": built.targets, "paired": built.paired,
@@ -665,19 +641,29 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
         loop_stats = dict(maker.stats, pairs_known=len(maker.pairs))
     t_loop = time.time()
 
-    # v2-c. 필수 정류장을 기존 후보(편도·순회형)에 끼운 버전
+    def usable(c: Candidate) -> bool:
+        return not (p.loop_only and c.shape != "loop")
+
+    def covers(c: Candidate, m: str) -> bool:
+        """덮음 = 첫·끝이 아닌 정차로 지남."""
+        return m in c.stops[1:-1]
+
+    # v2-c. 필수 정류장을 가까운 기존 후보(편도·순회형)에 우회율 한도 안에서 끼운 버전
     if must:
         lim_ins = lim
+        for m in must:
+            if m in known and any(covers(c, m) for c in raw.values() if usable(c)):
+                must_stats["covered_by_existing"].append(m)
         for key in sorted(raw, key=lambda k: (k[0], k[1], k[2], k[3])):
             c = raw[key]
-            if c.origin == "must_insert" or (p.loop_only and c.shape != "loop"):
+            if c.origin == "must_insert" or not usable(c):
                 continue
             for m in must:
                 if m not in known or m in c.stops:
                     continue
                 if min(net.stop_dist_m(m, s) for s in c.stops) > p.must_insert_radius_m:
                     continue
-                got = _insert_must(graph, c.stops, c.turn, m)
+                got = _insert_must(graph, c.stops, c.turn, m)   # 이웃 두 정류장 사이에 끼우므로 첫·끝이 아니다
                 ok = False
                 if got is not None:
                     new, nt = got
@@ -693,6 +679,43 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
                     add(c.kind, new, "must_insert", c.hubs, c.cluster, f"must:{m}", c.shape, nt,
                         dict(c.loop_info or {}, must_inserted=m) if c.shape == "loop" else None)
     t_mi = time.time()
+
+    # v2-d. 끼울 후보가 없는(덮는 후보가 하나도 없는) 필수 정류장만 전용 후보:
+    #       가까운 역 egress 정류장 → 필수 정류장(회차) → 역 쪽으로 돌아오는 순환(우회율은 보지 않음, 길이·S2·U턴만).
+    #       순환을 끈 경우는 역 egress → 필수 정류장 → 역 access 편도. 어느 쪽이든 필수 정류장은 첫·끝이 아니다.
+    if must:
+        lim_free = Limits(L_max_s, p.max_stops, float("inf"))
+        stations = sorted(k for k, st in net.stations.items()
+                          if (st.egress_stop or st.access_stop) in known)
+        for m in must:
+            if m not in known or any(covers(c, m) for c in raw.values() if usable(c)):
+                continue
+            near = sorted(stations, key=lambda k: (net.station_stop_dist_m(k, m), k))[: p.must_feeder_stations]
+            made = None
+            for k in near:
+                st_ = net.stations[k]
+                e, a_ = st_.egress_stop or st_.access_stop, st_.access_stop or st_.egress_stop
+                seed = graph.path(e, m)
+                if seed is None or len(seed) < 2 or graph.violations(seed, frozenset({e}), lim_free):
+                    continue
+                if p.loops:
+                    built = maker.build(seed, [], detour_free=True)
+                    if built is None or route_cycle(built.stops, net.tt, scenario) is None:
+                        continue
+                    add("loop_egress", built.stops, "must_feeder", (k,), cl_of.get(k), f"must:{m}", "loop",
+                        built.turn, {"must_dedicated": m, "deadhead_s": built.deadhead_s})
+                else:
+                    back = graph.path(m, a_)
+                    if back is None:
+                        continue
+                    seq = seed + back[1:]
+                    if (len(set(seq)) != len(seq) or graph.violations(seq, frozenset({e, a_}), lim_free)
+                            or route_cycle(seq, net.tt, scenario) is None):
+                        continue
+                    add("egress", seq, "must_feeder", (k,), cl_of.get(k), f"must:{m}")
+                made = k
+                break
+            must_stats["dedicated"][m] = made
 
     # 7. 덮개·주기
     endpoints = endpoint_set(net, p.endpoints, depots)

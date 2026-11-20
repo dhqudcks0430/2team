@@ -27,7 +27,8 @@
 
 v2 추가 출력
 - plans/<plan_id>.plan_report.json: 노선별 형태(편도/순회형)·시간당 운행, 필수 정류장별 덮는 노선·시간당 운행,
-  must_stop_infeasible과 정류장 목록, 설정 전체와 해시, 코드 커밋. plan.json 형식은 바꾸지 않는다.
+  must_stop_uncovered(정류장·이유), 필수 정류장을 끈 배분과의 차이(바뀐 노선·대수, 근사 충족 차이), 설정 전체와 해시,
+  코드 커밋. plan.json 형식은 바꾸지 않는다.
 - must_stops/: 이 묶음의 필수 정류장 계산 결과(`must_stops.for_bundle`).
 """
 
@@ -136,7 +137,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--must-radius-m", type=float, default=MS.MustConfig.radius_m)
     ap.add_argument("--must-kinds", default=None, help="쉼표 목록(kind 또는 type). 기본: 전부")
     ap.add_argument("--must-no-gg", action="store_true", help="필수 정류장 판정에서 경기 노선을 계속 운행으로 보지 않는다")
-    ap.add_argument("--must-max-wait-min", type=int, default=20, help="필수 정류장 대기 한도(분) → 시간당 60/W회")
+    ap.add_argument("--must-min-tph", type=float, default=0.0,
+                    help="필수 정류장 시간당 최소 운행(덮는 개설 노선 합). 기본 0 = 요구하지 않음(배차 20분 규칙으로 따라옴)")
     ap.add_argument("--must-insert-radius-m", type=float, default=d.must_insert_radius_m)
     ap.add_argument("--pair-radius-m", type=float, default=UNSET, help="길 건너 짝 거리(이름 같음). 기본: 프로필(v2 100)")
     ap.add_argument("--return-detour", type=float, default=None,
@@ -233,9 +235,9 @@ def main(argv: list[str] | None = None) -> int:
                       must_insert_radius_m=args.must_insert_radius_m, pair_radius_m=args.pair_radius_m,
                       return_detour=args.return_detour, loop_detour=args.loop_detour, close_max_s=args.close_max_s,
                       loop_only=args.loops, loop_max_detour=args.loop_max_detour, hub_min_count=args.hub_min_count)
-    ap_ = A.AllocParams()
+    ap_ = A.AllocParams(keep_n0=args.profile == "v2")   # v2: 열린 노선은 n0대 이상(최대 배차 = 대기 한도 20분)
     settings = {"profile": args.profile, "params": asdict(params) | {"f_min": params.f_min},
-                "alloc_params": asdict(ap_), "must_max_wait_s": args.must_max_wait_min * 60,
+                "alloc_params": asdict(ap_), "must_min_tph": args.must_min_tph,
                 "must_config": must_res["config"] if must_res else None,
                 "facilities": str(args.facilities) if args.facilities else None,
                 "facilities_sha256": sio.sha256_file(args.facilities) if args.facilities else None,
@@ -319,8 +321,11 @@ def main(argv: list[str] | None = None) -> int:
                 return None
             return {s: tuple(c.route_id for c in pool if s in c.must) for s in must_list}
         models = {lab: A.Model([(c.route_id, c.cycle_s, c.cover_keys) for c in pool], demand.od, ap_,
-                               _must_of(pool), args.must_max_wait_min * 60 if must_list else None)
+                               _must_of(pool), args.must_min_tph)
                   for lab, pool in (("sp", pools["sp"][0]), ("ours", ours_pool))}
+        # 필수 정류장을 끈 같은 풀의 배분(필수 정류장 효과 비교용)
+        free_models = ({lab: A.Model([(c.route_id, c.cycle_s, c.cover_keys) for c in pool], demand.od, ap_)
+                        for lab, pool in (("sp", pools["sp"][0]), ("ours", ours_pool))} if must_list else {})
         for fleet in args.fleets:
             allocs = {}
             for label in ("sp", "ours"):
@@ -338,8 +343,7 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 alloc = allocs[label] = A.allocate(model, fleet, starts)
                 vinfo["alloc_seconds"][f"{label}_f{fleet}"] = round(time.time() - t1, 2)
-                if label == "ours" and (model.covered(alloc["n"]), alloc["value"]) < (
-                        models["sp"].covered(allocs["sp"]["n"]), allocs["sp"]["value"] - 1e-6):
+                if not must_list and label == "ours" and alloc["value"] < allocs["sp"]["value"] - 1e-6:
                     raise SystemExit(f"{variant} f{fleet}: 우리 안 근사 {alloc['value']:.3f} < 피더안 {allocs['sp']['value']:.3f}")
                 det = model.detail(alloc["n"])
                 plan_id = f"plan-{PLAN_LABELS[label]}-{variant}-f{fleet}"
@@ -383,12 +387,26 @@ def main(argv: list[str] | None = None) -> int:
                 if alloc.get("must"):
                     inv = {cid: rid for rid, cid in route_map.items()}
                     m = alloc["must"]
-                    must_rep = {"enabled": True, "must_wait_s": m["must_wait_s"],
-                                "need_trips_per_hour": m["need_trips_per_hour"],
+                    # 필수 정류장을 끈 배분과 비교: 바뀐 노선·대수, 근사 충족 차이
+                    free = A.allocate(free_models[label], fleet,
+                                      starts if label == "ours" else None)
+                    fn, wn = free["n"], alloc["n"]
+                    effect = {"approx_with_must": round(alloc["value"], 4), "approx_without_must": round(free["value"], 4),
+                              "approx_diff": round(alloc["value"] - free["value"], 4),
+                              "routes_added": [{"candidate": c, "route_id": inv.get(c), "vehicles": wn[c],
+                                                "must": list(by_id[c].must)} for c in sorted(set(wn) - set(fn))],
+                              "routes_removed": [{"candidate": c, "vehicles": fn[c]} for c in sorted(set(fn) - set(wn))],
+                              "vehicles_changed": [{"candidate": c, "route_id": inv.get(c), "without": fn[c], "with": wn[c]}
+                                                   for c in sorted(set(fn) & set(wn)) if fn[c] != wn[c]],
+                              "uncovered_without_must": sorted(set(m["stops"]) - free_models[label].covered_set(fn)
+                                                               if free_models[label].must else
+                                                               set(s_ for s_ in m["stops"]
+                                                                   if not any(r in fn for r in model.must[s_])))}
+                    must_rep = {"enabled": True, "definition": m["definition"], "must_min_tph": m["must_min_tph"],
                                 "start_vehicles": m["start_vehicles"],
                                 "stops": {s: dict(v, routes=[inv[r] for r in v["routes"]]) for s, v in m["stops"].items()},
-                                "must_stop_infeasible": m["must_stop_infeasible"], "infeasible": m["infeasible"],
-                                "milp": "없음(표준 라이브러리만, 솔버 미설치)"}
+                                "must_stop_uncovered": m["must_stop_uncovered"], "effect_vs_no_must": effect,
+                                "milp": "없음(표준 라이브러리만, 솔버 미설치). 넣을 때 제약 Σ_{r∋s} y_r ≥ 1"}
                 report = {"plan_id": plan_id, "label": label, "variant": variant, "fleet": fleet,
                           "plan_sha256": sio.sha256_file(path), "profile": args.profile,
                           "shape_counts": {sh: sum(1 for r in rep_routes.values() if r["shape"] == sh)
@@ -402,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
                     json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
                 manifest["plans"][-1]["plan_report"] = str(out / "plans" / f"{plan_id}.plan_report.json")
                 if alloc.get("must"):
-                    manifest["plans"][-1]["must_stop_infeasible"] = alloc["must"]["must_stop_infeasible"]
+                    manifest["plans"][-1]["must_stop_uncovered"] = alloc["must"]["must_stop_uncovered"]
         manifest["variants"][variant] = vinfo
         print(f"{variant}: 허브 {len(res.hubs)} · 군집 {len(res.clusters)} · 후보 {len(res.candidates)} "
               f"(ours {len(pools['ours'][0])}, sp {len(pools['sp'][0])}) · {time.time() - t0:.1f}s", flush=True)

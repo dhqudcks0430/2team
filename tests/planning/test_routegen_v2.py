@@ -243,47 +243,63 @@ class MustRuleTest(unittest.TestCase):
 
 # ---------------------------------------------------------------- 배분 제약
 
-def must_model(must, cycles=None, demand=None):
+def must_model(must, cycles=None, demand=None, min_tph=0.0, keep_n0=False):
     cycles = cycles or {"rA": 3600, "rB": 2400, "rC": 1200, "rD": 1200}
     keys = {"rA": (("a", "x"),), "rB": (("b", "x"),), "rC": (("c", "x"),), "rD": (("d", "x"),)}
     od = demand or {("a", "x"): [5, 5, 5, 5], ("b", "x"): [5, 5, 5, 5], ("c", "x"): [200, 200, 200, 200],
                     ("d", "x"): [150, 150, 150, 150]}
-    return A.Model([(r, cycles[r], keys[r]) for r in sorted(cycles)], od, A.AllocParams(), must)
+    return A.Model([(r, cycles[r], keys[r]) for r in sorted(cycles)], od, A.AllocParams(keep_n0=keep_n0), must, min_tph)
 
 
 class MustAllocTest(unittest.TestCase):
-    def test_constraint_holds_for_all_starts_and_local_search(self):
-        m = must_model({"m1": ("rA",), "m2": ("rB", "rC")})
-        res = A.allocate(m, 8)
-        self.assertEqual(sum(res["n"].values()), 8)
-        self.assertEqual(res["must"]["infeasible"], [])
-        self.assertFalse(res["must"]["must_stop_infeasible"])
-        for name, run in res["inits"].items():
-            self.assertEqual(run["covered"], 2, name)
-            self.assertGreaterEqual(run["n"].get("rA", 0), 3, name)          # 3600/1200 = 3대 이상
-        # 시간당 운행 ≥ 3
-        self.assertTrue(all(v["trips_per_hour"] >= 3 - 1e-9 for v in res["must"]["stops"].values()))
+    """덮음 = 개설 노선 중 하나 이상이 지남(첫·끝 제외는 호출자가 must 목록을 만들 때 반영). 하드 제약."""
 
-    def test_unconstrained_would_drop_must_route(self):
+    def test_unconstrained_drops_must_route_but_constraint_opens_it(self):
         free = A.allocate(must_model(None), 4)
-        self.assertNotIn("rA", free["n"])                                     # 제약 없으면 rA는 안 연다
+        self.assertNotIn("rA", free["n"])                                     # 제약이 없으면 rA는 안 연다
         held = A.allocate(must_model({"m1": ("rA",)}), 4)
-        self.assertEqual(held["n"].get("rA"), 3)                              # 제약이 있으면 3대(시간당 3회)
+        self.assertIn("rA", held["n"])                                        # 덮음 하드 제약: rA를 연다
+        self.assertEqual(held["must"]["must_stop_uncovered"], [])
+        self.assertTrue(held["must"]["stops"]["m1"]["covered"])
 
-    def test_infeasible_reports_and_maximizes_covered(self):
+    def test_no_trips_per_hour_requirement_by_default(self):
+        held = A.allocate(must_model({"m1": ("rA",)}), 4)
+        self.assertEqual(held["n"]["rA"], 1)            # 시간당 운행은 요구하지 않는다(v1 배분은 1대까지 줄임)
+        held = A.allocate(must_model({"m1": ("rA",)}, keep_n0=True), 4)
+        self.assertEqual(held["n"]["rA"], 3)            # v2: 열린 노선은 n0 = ⌈3600/1200⌉ = 3대 이상(배차 20분)
+        tph = A.allocate(must_model({"m1": ("rA",)}, min_tph=4), 6)
+        self.assertGreaterEqual(tph["n"]["rA"], 4)      # --must-min-tph 4 → rA 4대 이상(주기 3600초)
+
+    def test_keep_n0_never_shifts_below_n0(self):
+        m = must_model(None, keep_n0=True)
+        for name, run in A.allocate(m, 8)["inits"].items():
+            for r, k in run["n"].items():
+                self.assertGreaterEqual(k, m.n0[r], (name, r))
+
+    def test_greedy_opens_highest_gain_cover_first(self):
+        m = must_model({"m1": ("rA", "rC")})
+        res = A.allocate(m, 4)
+        self.assertEqual(res["must"]["start"], {"rC": 1})                    # rC가 이득이 크다(수요 200)
+        self.assertTrue(res["must"]["stops"]["m1"]["covered"])
+
+    def test_uncovered_reasons_and_rest_allocated(self):
         m = must_model({"m1": ("rA",), "m2": ("rB",), "m3": ()})
-        res = A.allocate(m, 2)                                                # rA 3대·rB 2대 필요, 2대뿐
-        self.assertTrue(res["must"]["must_stop_infeasible"])
-        self.assertEqual(res["must"]["infeasible"], ["m1", "m3"])            # m2(rB 2대)만 덮는다
-        self.assertEqual(res["n"], {"rB": 2})
+        res = A.allocate(m, 2)                                                # rA 3대 필요, 2대뿐
+        got = {x["stop"]: x["reason"] for x in res["must"]["must_stop_uncovered"]}
+        self.assertEqual(got, {"m1": "budget", "m3": "no_candidate"})
+        self.assertIn("rB", res["n"])                                         # 덮을 수 있는 m2는 덮는다
+        self.assertEqual(sum(res["n"].values()), 2)
 
     def test_local_search_rejects_breaking_moves(self):
         m = must_model({"m1": ("rA",)})
+        m.required = frozenset({"m1"})
         n, _ = A.local_search(m, 5, {"rA": 3, "rC": 2})
-        self.assertGreaterEqual(n.get("rA", 0), 3)
+        self.assertIn("rA", n)
+        for name, run in A.allocate(must_model({"m1": ("rA",)}), 5)["inits"].items():
+            self.assertIn("rA", run["n"], name)
 
-    def test_milp_not_available_is_documented(self):
-        self.assertIn("MILP", A.__doc__)
+    def test_milp_constraint_documented(self):
+        self.assertIn("Σ_{r ∋ s} y_r ≥ 1", A.__doc__)
 
 
 # ---------------------------------------------------------------- 생성 + 배분 결정론
@@ -332,14 +348,22 @@ class GenerateV2Test(unittest.TestCase):
                                         "valid_until_s": 43200, "segments": _segments(stops, [
                                             ("N1", "N2"), ("N2", "N3"), ("N3", "N4"), ("N4", "H"), ("H", "E"),
                                             ("E", "S4"), ("S4", "S3"), ("S3", "S2"), ("S2", "S1"), ("S1", "N1"),
-                                            ("M", "N1"), ("N1", "M")])})
+                                            ("N1", "M"), ("M", "N2")])})   # M: N1에서 들어와 N2로 나감
         net = Network(tt, stops, net.stations)
         res = G.generate(net, street_demand(), scenario(4), self.params(must_stops=("M",)))
-        feeders = [c for c in res.candidates if c.origin == "must_feeder"]
+        covering = [c for c in res.candidates if "M" in c.must]
+        self.assertTrue(covering)                                                        # M을 첫·끝이 아닌 정차로 덮는 후보
+        self.assertTrue(all("M" in c.stops[1:-1] for c in covering))
+        inserted = [c for c in res.candidates if c.origin == "must_insert"]
+        self.assertTrue(all(c.detour <= 3.0 + 1e-9 for c in inserted))                # 끼운 버전은 우회율 한도 안
+        if res.must_stats["insert"].get("M", {}).get("ok") or res.must_stats["covered_by_existing"]:
+            self.assertIsNone(res.must_stats["dedicated"].get("M"))                     # 끼울 수 있으면 전용 후보를 안 만든다
+        # 끼울 수 없으면(반경 0) 전용 후보: 역 egress → M(회차) → 역 쪽 순환, 우회율은 보지 않는다
+        res2 = G.generate(net, street_demand(), scenario(4), self.params(must_stops=("M",), must_insert_radius_m=0.0))
+        feeders = [c for c in res2.candidates if c.origin == "must_feeder"]
         self.assertTrue(feeders)
-        self.assertTrue(all(c.shape == "loop" and c.stops[0] == "M" for c in feeders))
-        self.assertGreater(max(c.detour for c in feeders), 1.6)
-        self.assertTrue(all(c.detour <= 1.6 + 1e-9 for c in res.candidates if c.origin == "must_insert"))
+        self.assertTrue(all(c.shape == "loop" and "M" in c.stops[1:-1] for c in feeders))
+        self.assertGreater(max(c.detour for c in feeders), 3.0)
 
     def test_endpoint_filter(self):
         net, dem, sc = street_network(), street_demand(), scenario(4)

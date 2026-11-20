@@ -284,8 +284,19 @@ class LoopMaker:
             seq, skipped, joined = self._extend(fwd, targets)
         turn = len(fwd) - 1
         if len(seq) <= len(fwd):
-            self.stats["failed"] += 1
-            return None
+            # 오는 쪽 목표를 하나도 못 이었다: 고리 닫기 상한이 있으면 끝(회차) → 기점 길을 영업으로 이어 닫아 본다
+            cp = self._close_path(list(fwd)) if self.close_max_s is not None else None
+            if cp is None or len(cp) < 3 or self.g.weight(cp[-2], cp[-1]) > self.close_max_s:
+                self.stats["failed"] += 1
+                return None
+            stops = tuple(fwd) + cp[1:-1]
+            if not self._ok(stops, turn):
+                self.stats["failed"] += 1
+                return None
+            self.stats["built"] += 1
+            self.stats["closed_in_service"] = self.stats.get("closed_in_service", 0) + 1
+            return LoopBuild(stops, turn, len(targets), 0, sorted(set(skipped) | set(missing)), [],
+                             self.g.weight(cp[-2], cp[-1]))
         # 끝 자르기: 첫 정류장까지 공차가 가장 짧은 오는 쪽 정류장(동률이면 뒤쪽)
         best = None
         for j in range(turn + 1, len(seq)):

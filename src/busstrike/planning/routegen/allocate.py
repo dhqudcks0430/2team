@@ -9,7 +9,7 @@
 탐욕: 지연 평가(CELF) 우선순위 큐.
 국소 탐색(v1): 매 회차 아래 이동을 모두 평가해 가장 좋은 개선 하나를 받는다. 개선이 없으면
 가치 낮은 노선 닫고 재배분(close_reopt)을 시도하고, 그것도 없으면 멈춘다.
-- shift1·shift2·shift3: 열린 노선 a에서 b로 k대(a는 1대 이상 남김)
+- shift1·shift2·shift3: 열린 노선 a에서 b로 k대(a는 1대 이상 남김. AllocParams.keep_n0(v2)이면 n0대 이상)
 - swap: 열린 노선 a를 닫고 안 열린 후보 c를 n0[c]대로 연다. 대수가 모자라면 다른 노선에서
   1대씩(뺄 때 손실이 가장 작은 노선부터, 1대는 남김) 가져오고, 남으면 fill로 넣는다.
 초기해 여러 개(탐욕 + fill, 수요 상위 노선부터 n0씩, 호출자가 준 해 — 예: 피더안 배분)에서 각각 국소 탐색을
@@ -18,14 +18,17 @@
 난수를 쓰지 않는다. 동률은 노선 ID 순.
 
 필수 정류장 제약(v2, `Model(must=...)`을 줄 때만)
-    모든 필수 정류장 s: Σ_{r ∋ s, 개설} n_r × 3600 / C_r ≥ 3600 / W_must   (기본 W_must = 20분 → 시간당 3회)
-- 초기해: 필수 정류장을 모두 덮는 최소 대수 조합(`must_start`: 덮는 수 ÷ n0가 큰 노선부터, 남는 노선 정리)에서
-  시작해 탐욕·fill로 나머지를 배분한다. 다른 초기해(수요 상위, 호출자가 준 해)도 must_start 위에서 만든다.
-- 비교는 사전식 (덮은 필수 정류장 수, 근사 충족). 국소 탐색은 덮은 수를 줄이는 이동을 받지 않는다.
-  그래서 처음부터 다 덮으면 제약을 깨는 이동은 하나도 받지 않는다.
-- 차량이 모자라 다 덮지 못하면 덮는 수를 먼저 최대화하고(must_start가 예산 안에서 최대한 덮음), 결과에
-  infeasible(덮지 못한 정류장 목록)을 남긴다. 조용히 무시하지 않는다.
-- MILP: 이 패키지는 표준 라이브러리만 쓰고 솔버가 없어 MILP 배분은 없다(제약 식은 위와 같다).
+- 덮음: 개설 노선 중 하나 이상이 필수 정류장 s에 정차하고, s가 그 노선 영업 구간의 첫·끝 정류장이 아니다
+  (must[s] = 그런 후보 노선들; 호출자가 첫·끝을 뺀 정차로 만든다). 시간당 운행 수는 요구하지 않는다(모든 노선의
+  최대 배차 = 대기 한도 20분 규칙으로 따라온다). `must_min_tph` > 0이면 그 시간당 운행도 요구한다(기본 0).
+- 하드 제약: 덮을 수 있는 필수 정류장은 모두 덮는다.
+  - 초기해(`must_start`): 아직 덮지 못한 필수 정류장을 덮는 후보 중 근사 이득(n0대로 열 때)이 가장 큰 것부터 연다.
+    그 뒤 탐욕(CELF)·fill로 나머지 대수를 배분한다. 다른 초기해(수요 상위, 호출자가 준 해)도 must_start 위에서 만든다.
+  - 국소 탐색은 덮음을 깨는 이동(필수 정류장을 덮는 마지막 노선을 닫는 이동 등)을 거절한다.
+  - MILP(솔버가 있으면): Σ_{r ∋ s} y_r ≥ 1 (y_r = 노선 r 개설 여부, n_r ≤ budget × y_r). 이 패키지는 표준 라이브러리만
+    써서 MILP 배분은 없다.
+- 덮을 수 없으면(지나는 후보 없음 no_candidate, 대수 부족 budget) 그 정류장은 제약에서 빼고 보고서
+  must_stop_uncovered(정류장·이유)에 남긴다. 나머지는 평소대로 배분한다.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ class AllocParams:
     wait_s: int = 1200
     seat: int = 45
     kappa: float = 1.0
+    keep_n0: bool = False      # v2: 열린 노선은 n0 = ⌈C/W⌉대 아래로 줄이지 않는다(모든 노선 최대 배차 = 대기 한도 W)
 
 
 class Model:
@@ -52,10 +56,11 @@ class Model:
 
     def __init__(self, routes: list[tuple[str, int, tuple[tuple[str, str], ...]]],
                  od_hourly: dict[tuple[str, str], list[float]], p: AllocParams = AllocParams(),
-                 must: dict[str, tuple[str, ...]] | None = None, must_wait_s: int | None = None):
+                 must: dict[str, tuple[str, ...]] | None = None, must_min_tph: float = 0.0):
         self.p = p
         self.must = {s: tuple(sorted(rs)) for s, rs in sorted((must or {}).items())}
-        self.must_wait_s = must_wait_s or p.wait_s
+        self.must_min_tph = must_min_tph
+        self.required: frozenset[str] = frozenset()     # 하드 제약으로 지킬 필수 정류장(배분 때 정한다)
         self.ids = sorted(r for r, _, _ in routes)
         self.cycle = {r: c for r, c, _ in routes}
         keys = sorted({k for _, _, ks in routes for k in ks})
@@ -67,6 +72,10 @@ class Model:
         self.rank = {r: i for i, r in enumerate(self.ids)}
         self.demand_of = {r: sum(sum(self.d[ki]) for ki in self.cover[r]) for r in self.ids}
         self._cache: dict[tuple, float] = {}
+
+    def floor(self, r: str) -> int:
+        """열린 노선의 최소 대수: keep_n0이면 n0(배차 ≤ 대기 한도), 아니면 1(v1)."""
+        return self.n0[r] if self.p.keep_n0 else 1
 
     def detail(self, n: dict[str, int]) -> dict:
         """{'total', 'by_route': {r: [h6..h9 승객]}, 'demand_covered', 'cap_cut'}."""
@@ -103,20 +112,22 @@ class Model:
         return got
 
     # ------------------------------------------------------------ 필수 정류장
-    def must_freq(self, n: dict[str, int]) -> dict[str, float]:
-        """필수 정류장마다 시간당 운행 = Σ n_r × 3600 / C_r."""
+    def must_tph(self, n: dict[str, int]) -> dict[str, float]:
+        """필수 정류장마다 그 정류장을 덮는 개설 노선의 시간당 운행 합 = Σ n_r × 3600 / C_r."""
         return {s: sum(n.get(r, 0) * 3600 / self.cycle[r] for r in rs) for s, rs in self.must.items()}
 
-    def must_ok(self, n: dict[str, int]) -> set[str]:
-        need = 3600 / self.must_wait_s
-        return {s for s, f in self.must_freq(n).items() if f >= need - EPS}
+    def covered_set(self, n: dict[str, int]) -> set[str]:
+        """덮인 필수 정류장(개설 노선 중 하나 이상이 첫·끝이 아닌 정차로 지나고, must_min_tph > 0이면 그 운행도 충족)."""
+        out = set()
+        for s, rs in self.must.items():
+            if any(n.get(r, 0) > 0 for r in rs):
+                if self.must_min_tph <= 0 or sum(n.get(r, 0) * 3600 / self.cycle[r] for r in rs) >= self.must_min_tph - EPS:
+                    out.add(s)
+        return out
 
-    def covered(self, n: dict[str, int]) -> int:
-        return len(self.must_ok(n)) if self.must else 0
-
-    def score(self, n: dict[str, int]) -> tuple[int, float]:
-        """사전식 비교 값(덮은 필수 정류장 수, 근사). must가 없으면 (0, 근사)라 v1과 같은 비교다."""
-        return (self.covered(n), self.value(n))
+    def feasible(self, n: dict[str, int]) -> bool:
+        """하드 제약(required의 모든 정류장을 덮음)을 지키는가."""
+        return not self.required or self.required <= self.covered_set(n)
 
 
 def _with(n: dict[str, int], r: str, k: int) -> dict[str, int]:
@@ -201,7 +212,7 @@ def swap(model: Model, budget: int, n: dict[str, int], a: str, c: str) -> dict[s
     m = {x: y for x, y in n.items() if x != a}
     m[c] = model.n0[c]
     while sum(m.values()) > budget:
-        donors = [x for x in sorted(m) if x != c and m[x] > 1]
+        donors = [x for x in sorted(m) if x != c and m[x] > model.floor(x)]
         if not donors:
             return None
         base = model.value(m)
@@ -222,7 +233,6 @@ def local_search(model: Model, budget: int, n: dict[str, int], max_rounds: int =
     """
     st = stats if stats is not None else _new_stats()
     cur = model.value(n)
-    cov = model.covered(n)
     log: list[dict] = []
     for _ in range(max_rounds):
         best = None
@@ -232,21 +242,15 @@ def local_search(model: Model, budget: int, n: dict[str, int], max_rounds: int =
             st[info["move"]]["tries"] += 1
             if m is None:
                 return
-            if model.must:
-                c = model.covered(m)
-                if c < cov:
-                    return                                 # 필수 정류장 제약을 깨는(덮은 수를 줄이는) 이동은 받지 않는다
-                v = model.value(m)
-                if (c > cov or v > cur + EPS) and (best is None or (c, v) > (best[3], best[0] + EPS)):
-                    best = (v, m, info, c)
-                return
+            if model.required and not model.feasible(m):
+                return                                     # 필수 정류장 덮음을 깨는 이동은 받지 않는다
             v = model.value(m)
             if v > cur + EPS and (best is None or v > best[0] + EPS):
                 best = (v, m, info)
 
         for k in (1, 2, 3):
             for a in sorted(n):
-                if n[a] <= k:
+                if n[a] - k < model.floor(a):
                     continue
                 for b in sorted(n):
                     if a != b:
@@ -267,8 +271,6 @@ def local_search(model: Model, budget: int, n: dict[str, int], max_rounds: int =
         st[best[2]["move"]]["accepts"] += 1
         log.append(dict(best[2], gain=round(best[0] - cur, 6)))
         cur, n = best[0], best[1]
-        if model.must:
-            cov = best[3]
     return n, log
 
 
@@ -277,56 +279,50 @@ def _check(n: dict[str, int], budget: int, model: Model, name: str) -> None:
         raise AssertionError(f"{name}: vehicle sum {sum(n.values())} != {budget} or bad route")
 
 
-def must_start(model: Model, budget: int) -> dict[str, int]:
-    """필수 정류장을 모두 덮는 적은 대수 조합(탐욕 집합 덮개).
+def must_start(model: Model, budget: int) -> tuple[dict[str, int], dict[str, str]]:
+    """필수 정류장 덮기 초기해. 돌려주는 값: (배분, 못 덮은 정류장 → 이유).
 
-    노선 r을 n0[r] = ⌈C_r/W⌉대로 열면 r 위의 필수 정류장은 모두 시간당 3600/W회 이상이 된다(W = 대기 한도).
-    덜 덮인 정류장 수 ÷ 필요 대수가 큰 노선부터 연다(동률: 덮는 수요 큰 쪽, 노선 ID). 다만 이미 열린 노선의
-    부족분은 대수를 더해 채우는 것과도 비교한다. 예산을 넘는 노선은 건너뛴다. 끝에 없어도 다 덮이는 노선은 닫는다.
+    아직 덮지 못한 필수 정류장을 덮는 후보 중 n0대로 열 때 근사 이득이 가장 큰 것부터 연다(동률: 새로 덮는 정류장 수,
+    노선 ID). 지나는 후보가 없으면 no_candidate, 남은 대수로 열 수 있는 후보가 없으면 budget.
+    must_min_tph > 0이면 덮은 노선에 그 운행이 될 때까지 1대씩 더한다.
     """
-    W = model.must_wait_s
     n: dict[str, int] = {}
-    routes = sorted({r for rs in model.must.values() for r in rs})
-
-    def need(r: str) -> int:
-        return max(1, math.ceil(model.cycle[r] / W))
-
+    uncovered = {s: "no_candidate" for s, rs in model.must.items() if not rs}
     while True:
-        ok = model.must_ok(n)
-        todo = [s for s in model.must if s not in ok]
+        done = model.covered_set(n)
+        todo = [s for s in model.must if s not in done and s not in uncovered]
         if not todo:
             break
         left = budget - sum(n.values())
+        base = model.value(n)
         best = None
-        for r in routes:
-            gets = [s for s in todo if r in model.must[s]]
-            if not gets:
-                continue
-            k = need(r) - n.get(r, 0)
-            if k <= 0 or k > left:
+        for r in sorted({r for s in todo for r in model.must[s]}):
+            if r in n:                              # 열렸는데 덮지 못함 = 시간당 운행 부족(must_min_tph): 1대 더
+                k = 1
+            else:                                   # n0대, must_min_tph가 있으면 그 운행에 필요한 대수까지
+                k = max(model.n0[r], math.ceil(model.must_min_tph * model.cycle[r] / 3600 - EPS))
+            if k > left:
                 continue
             m = _with(n, r, k)
-            newly = len(model.must_ok(m)) - len(ok)
-            if newly <= 0:
+            newly = len(model.covered_set(m) - done)
+            if newly <= 0 and r not in n:
                 continue
-            key = (newly / k, model.demand_of[r], -model.rank[r])
+            key = (model.value(m) - base, newly, -model.rank[r])
             if best is None or key > best[0]:
                 best = (key, m)
         if best is None:
+            for s in todo:
+                uncovered[s] = "budget"
             break
         n = best[1]
-    for r in sorted(n, key=lambda x: (n[x], -model.rank[x])):      # 정리: 빼도 덮은 수가 같으면 닫는다
-        rest = {x: y for x, y in n.items() if x != r}
-        if len(model.must_ok(rest)) == len(model.must_ok(n)):
-            n = rest
-    return n
+    return n, uncovered
 
 
 def allocate(model: Model, budget: int, starts: dict[str, dict[str, int]] | None = None) -> dict:
     """초기해 여러 개 → 각각 국소 탐색 → 근사 최대(동률이면 앞 초기해).
 
     starts: 추가 초기해(이름 → 배분). 예산과 차량 합이 같고 이 모델의 노선만 써야 한다.
-    model.must가 있으면 비교는 사전식 (덮은 필수 정류장 수, 근사)이고 결과에 must 보고를 붙인다.
+    model.must가 있으면 덮을 수 있는 필수 정류장 덮음을 하드 제약으로 두고 결과에 must 보고를 붙인다.
     """
     if model.must:
         return _allocate_must(model, budget, starts)
@@ -374,12 +370,15 @@ def _top_demand_from(model: Model, budget: int, n: dict[str, int]) -> dict[str, 
 
 
 def _allocate_must(model: Model, budget: int, starts: dict[str, dict[str, int]] | None) -> dict:
-    base = must_start(model, budget)
+    base, uncovered = must_start(model, budget)
+    model.required = frozenset(model.covered_set(base))
     g = greedy(model, budget, base)
     v_greedy = model.value(g)
     f = fill(model, budget, g)
     inits = [("greedy", f), ("top_demand", _top_demand_from(model, budget, base))]
-    inits += sorted((starts or {}).items())
+    for name, st0 in sorted((starts or {}).items()):        # 호출자가 준 해는 제약을 지킬 때만 쓴다
+        if model.feasible(st0):
+            inits.append((name, st0))
     total_stats = _new_stats()
     runs: dict[str, dict] = {}
     chosen = None
@@ -388,25 +387,27 @@ def _allocate_must(model: Model, budget: int, starts: dict[str, dict[str, int]] 
         st = _new_stats()
         n, log = local_search(model, budget, dict(n0), stats=st)
         _check(n, budget, model, f"local search from {name}")
+        if not model.feasible(n):
+            raise AssertionError(f"local search from {name} broke the must-stop constraint")
         v = model.value(n)
         runs[name] = {"start": dict(sorted(n0.items())), "initial": model.value(n0), "final": v,
-                      "covered_initial": model.covered(n0), "covered": model.covered(n),
                       "n": dict(sorted(n.items())), "moves": log, "stats": st}
         for k in MOVES:
             for t in ("tries", "accepts"):
                 total_stats[k][t] += st[k][t]
-        if chosen is None or (runs[name]["covered"], v) > (runs[chosen]["covered"], runs[chosen]["final"] + EPS):
+        if chosen is None or v > runs[chosen]["final"] + EPS:
             chosen = name
     n = runs[chosen]["n"]
-    ok = model.must_ok(n)
-    freq = model.must_freq(n)
-    report = {"must_wait_s": model.must_wait_s, "need_trips_per_hour": round(3600 / model.must_wait_s, 4),
+    cov = model.covered_set(n)
+    tph = model.must_tph(n)
+    report = {"definition": "개설 노선 중 하나 이상이 첫·끝이 아닌 정차로 지남" +
+                            (f" + 시간당 {model.must_min_tph}회 이상" if model.must_min_tph > 0 else ""),
+              "must_min_tph": model.must_min_tph,
               "start": dict(sorted(base.items())), "start_vehicles": sum(base.values()),
-              "stops": {s: {"routes": [r for r in model.must[s] if r in n],
-                            "trips_per_hour": round(freq[s], 4), "ok": s in ok,
-                            "candidates": len(model.must[s])} for s in model.must},
-              "infeasible": sorted(s for s in model.must if s not in ok)}
-    report["must_stop_infeasible"] = bool(report["infeasible"])
+              "stops": {s: {"routes": [r for r in model.must[s] if r in n], "covered": s in cov,
+                            "trips_per_hour": round(tph[s], 4), "candidates": len(model.must[s])}
+                        for s in model.must},
+              "must_stop_uncovered": [{"stop": s, "reason": uncovered[s]} for s in sorted(uncovered)]}
     return {"n": n, "value": model.value(n), "chosen": chosen, "inits": runs, "move_stats": total_stats,
             "value_greedy": v_greedy, "value_filled": model.value(f), "greedy": dict(sorted(g.items())),
             "local_search": runs[chosen]["moves"], "must": report}
