@@ -19,7 +19,9 @@
 
 프로필(설계 v2 5절; 명시한 인자가 프로필 값보다 앞선다)
 - `--profile v1`: 순회형 끔, 필수 정류장 끔, 고정 한도(편도 20·30분, 정차 8) → 기존 v1과 바이트 단위로 같은 plan.json.
-- `--profile v2`(기본): 순회형 켬, 필수 정류장 켬(`--facilities` 필요), 길이 규칙 N=2, 정차 상한 없음, 우회율 1.6.
+- `--profile v2`(기본): 순환 운행만(편도 노선은 배분 후보·결과에 없다), 필수 정류장 켬(`--facilities` 필요),
+  길이 규칙 N=2, 정차 상한 없음, 우회율 1.6(고리 전체 ÷ 2×폭), 닫는 공차 ≤ 300초, 길 건너 짝 100m.
+  v1은 기존 결과와 바이트 비교(회귀)용이다. v1 안은 편도 + 빈 차 복귀라 운행안으로 쓰지 않는다.
 
 v2 추가 출력
 - plans/<plan_id>.plan_report.json: 노선별 형태(편도/순회형)·시간당 운행, 필수 정류장별 덮는 노선·시간당 운행,
@@ -70,9 +72,12 @@ UNSET = object()   # 프로필 값으로 채울 인자의 기본값(문자열이
 # 프로필 기본값. UNSET인 인자만 프로필 값으로 채운다.
 PROFILES: dict[str, dict] = {
     "v1": {"loops": False, "must_stops": False, "length_n": None, "l_max": (20, 30), "max_stops": 8,
-           "max_detour": 1.6, "endpoints": "all"},
+           "max_detour": 1.6, "endpoints": "all", "pair_radius_m": 50.0, "loop_detour": "direction",
+           "close_max_s": None},
+    # v2: 순환 운행만. 짝 100m·고리 전체 우회율은 지자체 셔틀안(2026-01, 25개 구) 모양을 근거로 정했다(설계 문서 7절).
     "v2": {"loops": True, "must_stops": True, "length_n": 2, "l_max": (20, 30), "max_stops": None,
-           "max_detour": 1.6, "endpoints": "all"},
+           "max_detour": 1.6, "endpoints": "all", "pair_radius_m": 100.0, "loop_detour": "loop_total",
+           "close_max_s": 300},
 }
 
 
@@ -126,18 +131,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--must-no-gg", action="store_true", help="필수 정류장 판정에서 경기 노선을 계속 운행으로 보지 않는다")
     ap.add_argument("--must-max-wait-min", type=int, default=20, help="필수 정류장 대기 한도(분) → 시간당 60/W회")
     ap.add_argument("--must-insert-radius-m", type=float, default=d.must_insert_radius_m)
-    ap.add_argument("--pair-radius-m", type=float, default=d.pair_radius_m, help="길 건너 짝 거리(이름 같음). 기본 50")
-    ap.add_argument("--return-detour", type=float, default=None, help="순회형 오는 쪽 우회율 상한. 기본: --max-detour")
-    ap.add_argument("--shapes", choices=("both", "loop"), default="both",
-                    help="배분 후보 형태. both = 편도·순회형 중 배분이 고름(기본), loop = 순회형만")
+    ap.add_argument("--pair-radius-m", type=float, default=UNSET, help="길 건너 짝 거리(이름 같음). 기본: 프로필(v2 100)")
+    ap.add_argument("--return-detour", type=float, default=None,
+                    help="순회형 오는 쪽 우회율 상한(--loop-detour direction일 때만). 기본: --max-detour")
+    ap.add_argument("--loop-detour", choices=("direction", "loop_total"), default=UNSET,
+                    help="순회형 우회율 재는 법. 기본: 프로필(v2 loop_total)")
+    ap.add_argument("--close-max-s", type=_opt_int, default=UNSET,
+                    help="순회형 닫는 공차(끝 → 기점) 상한(초). none = 없음. 기본: 프로필(v2 300)")
     ap.add_argument("--od-csv", type=Path, default=None,
                     help="정류장 → 정류장 수요(date,hour,origin_stop,dest_stop,flow). 주면 demand_flows 대신 쓴다")
     ap.add_argument("--scenario-variant", default="affected", help="--od-csv일 때 시나리오를 읽을 묶음 변형")
     args = ap.parse_args(argv)
     prof = PROFILES[args.profile]
-    for k in ("loops", "must_stops", "endpoints", "length_n", "l_max", "max_stops", "max_detour"):
+    for k in ("loops", "must_stops", "endpoints", "length_n", "l_max", "max_stops", "max_detour", "pair_radius_m",
+              "loop_detour", "close_max_s"):
         if getattr(args, k) is UNSET:
             setattr(args, k, prof[k])
+    if args.profile == "v2" and not args.loops:
+        raise SystemExit("v2는 순환 운행만 만든다 — 편도 노선안(--no-loops)은 없다")
     if args.must_stops and args.facilities is None:
         raise SystemExit("필수 정류장이 켜져 있다(--profile v2) — --facilities <facilities_seoul.csv>를 주거나 --no-must-stops")
 
@@ -181,7 +192,8 @@ def main(argv: list[str] | None = None) -> int:
                       max_detour=args.max_detour, sp_top=args.sp_top, jaccard=args.jaccard, home_gu=home_gu,
                       loops=args.loops, length_n=args.length_n, endpoints=args.endpoints, must_stops=must_list,
                       must_insert_radius_m=args.must_insert_radius_m, pair_radius_m=args.pair_radius_m,
-                      return_detour=args.return_detour)
+                      return_detour=args.return_detour, loop_detour=args.loop_detour, close_max_s=args.close_max_s,
+                      loop_only=args.loops)
     ap_ = A.AllocParams()
     settings = {"profile": args.profile, "params": asdict(params) | {"f_min": params.f_min},
                 "alloc_params": asdict(ap_), "must_max_wait_s": args.must_max_wait_min * 60,
@@ -189,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
                 "facilities": str(args.facilities) if args.facilities else None,
                 "facilities_sha256": sio.sha256_file(args.facilities) if args.facilities else None,
                 "od_csv": str(args.od_csv) if args.od_csv else None, "fleets": list(args.fleets),
-                "shapes": args.shapes,
+                "loop_only": params.loop_only,
                 "variants": args.variants, "root": str(root), "network_snapshot_id": net.tt.network_snapshot_id}
     settings_sha = _sha(settings)
     manifest = {"condition": args.condition, "fleets": list(args.fleets), "root_check": root_check, "root": str(root), "readme_title": (root / "README.md").read_text(encoding="utf-8").splitlines()[0],
@@ -222,10 +234,6 @@ def main(argv: list[str] | None = None) -> int:
         if policy.max_wait_s != ap_.wait_s or any(v.capacity != ap_.seat for v in scen0.vehicles):
             raise SystemExit("시나리오 정책(대기 한도·좌석)이 배분 파라미터와 다르다")
         res = G.generate(net, demand, scen0, params, depots)
-        if args.shapes == "loop":
-            if not params.loops:
-                raise SystemExit("--shapes loop에는 순회형 후보가 필요하다(--loops)")
-            res.candidates = [c for c in res.candidates if c.shape == "loop"]
         pools = G.pools(res.candidates, params.jaccard)
         t_gen = time.time() - t0
         vinfo = {

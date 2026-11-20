@@ -13,6 +13,8 @@
 
 v2(설정으로 켠다. 기본값은 모두 v1과 같은 동작 — `--profile v1`이 기존 plan.json을 바이트 단위로 그대로 낸다)
 - loops: 편도 후보마다 순회형(기점 → 회차 → 기점, `loop.LoopMaker`) 버전을 같이 만든다. kind = loop_<편도 kind>.
+- loop_only: 결과 후보(배분 풀)를 순회형만 남긴다. 편도 정차열은 순회형을 만드는 출발점으로만 쓴다.
+  셔틀은 순환 운행만 한다(편도 + 빈 차 복귀는 없다) — v2 프로필은 늘 켠다.
 - length_n: 길이 상한 = 운행 창 안에 N회 이상 돌 수 있는 길이. 생성 중에는 영업 시간 ≤ 창/N − 회차,
   마지막에 시뮬레이터 주기 ≤ 창/N. 주면 l_max_min(편도 20·30분) 대신 쓴다.
 - must_stops: 필수 정류장(`must_stops`)마다 ① 우회율 한도 안에서 기존 후보에 끼운 버전(origin must_insert),
@@ -35,7 +37,7 @@ from busstrike.sim.models import Scenario
 from .cycle import route_cycle
 from .data import Demand, Network, haversine_m
 from .graph import Graph, Limits
-from .loop import LoopMaker, loop_violations
+from .loop import LoopMaker, loop_detour, loop_violations
 
 ENDPOINT_MODES = ("all", "stations", "stations+depots")
 
@@ -64,7 +66,10 @@ class Params:
     must_insert_radius_m: float = 600.0   # 이 거리 안에 정류장이 있는 후보에만 필수 정류장을 끼워 본다
     must_feeder_stations: int = 3    # 전용 후보: 가까운 역 몇 개까지 시도
     pair_radius_m: float = 50.0      # 길 건너 짝: 이름이 같고 이 거리 안
-    return_detour: float | None = None   # 순회형 오는 쪽 우회율 상한(None = max_detour)
+    return_detour: float | None = None   # 순회형 오는 쪽 우회율 상한(None = max_detour, direction 방식만)
+    loop_detour: str = "direction"   # 순회형 우회율: direction(방향마다) | loop_total(고리 전체 ÷ 2×폭)
+    close_max_s: int | None = None   # 순회형 닫는 공차(끝 → 기점) 상한(초). None = 없음
+    loop_only: bool = False          # 결과 후보를 순회형만 남긴다(편도는 순회형을 만드는 출발점으로만 쓴다)
     loop_insert_top: int = 30        # 순회형 오는 쪽에 끼울 수요 정류장 후보 수(값 큰 순)
 
     @property
@@ -439,7 +444,7 @@ def _finish(c: Candidate, b: Builder, scenario: Scenario, p: Params,
     c.oneway_s = g.oneway_s(c.stops)
     c.length_m = g.length_m(c.stops)
     if c.shape == "loop":
-        c.detour = max(g.detour(c.stops[:c.turn + 1]), g.detour(c.stops[c.turn:]))
+        c.detour = loop_detour(g, c.stops, c.turn, p.loop_detour)
         c.n_stops = sum(1 for s in c.stops if s not in st_stops)
     else:
         c.detour = g.detour(c.stops)
@@ -627,7 +632,7 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
     loop_stats: dict = {}
     if p.loops:
         maker = LoopMaker(net, graph, b.od_total, p.max_detour, p.max_stops, L_max_s, p.pair_radius_m,
-                          p.loop_insert_top, p.return_detour)
+                          p.loop_insert_top, p.return_detour, p.loop_detour, p.close_max_s)
         for key in sorted(raw, key=lambda k: (k[0], k[1], k[2], k[3])):
             c = raw[key]
             if c.shape != "oneway":
@@ -647,7 +652,7 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
         lim_ins = lim
         for key in sorted(raw, key=lambda k: (k[0], k[1], k[2], k[3])):
             c = raw[key]
-            if c.origin == "must_insert":
+            if c.origin == "must_insert" or (p.loop_only and c.shape != "loop"):
                 continue
             for m in must:
                 if m not in known or m in c.stops:
@@ -659,7 +664,8 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
                 if got is not None:
                     new, nt = got
                     if c.shape == "loop":
-                        ok = not loop_violations(graph, new, nt, p.max_detour, p.max_stops, L_max_s, p.return_detour)
+                        ok = not loop_violations(graph, new, nt, p.max_detour, p.max_stops, L_max_s, p.return_detour,
+                                                 p.loop_detour)
                     else:
                         ok = not graph.violations(new, _station_stops(net, c.hubs), lim_ins)
                 st = must_stats["insert"].setdefault(m, {"tried": 0, "ok": 0})
@@ -681,6 +687,10 @@ def generate(net: Network, demand: Demand, scenario: Scenario, p: Params = Param
         else:
             dropped[why] = dropped.get(why, 0) + 1
     cands = [c for c in cands if c.cover > 0 or c.must]
+    if p.loop_only:
+        seeds = sum(1 for c in cands if c.shape != "loop")
+        cands = [c for c in cands if c.shape == "loop"]
+        loop_stats["oneway_seeds_not_allocated"] = seeds
     for i, c in enumerate(cands, start=1):
         c.route_id = f"c{i:04d}"
     t_fin = time.time()

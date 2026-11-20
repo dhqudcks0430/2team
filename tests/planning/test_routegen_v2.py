@@ -16,7 +16,7 @@ from busstrike.planning.routegen import must_stops as MS
 from busstrike.planning.routegen.cycle import route_cycle, single_route_plan
 from busstrike.planning.routegen.data import Demand, Network, Station, Stop
 from busstrike.planning.routegen.graph import Graph
-from busstrike.planning.routegen.loop import LoopMaker, loop_violations, opposite_pairs
+from busstrike.planning.routegen.loop import LoopMaker, loop_detour, loop_violations, opposite_pairs
 from busstrike.sim import io as sio
 from busstrike.sim.adapters.comparison_plan import check_plan
 from busstrike.sim.traveltime import TravelTimeTable
@@ -107,6 +107,21 @@ class LoopTest(unittest.TestCase):
         self.assertIn("N3", b.skipped)
         self.assertIn("S3", b.stops)                               # 최단경로로 지나며 들어온다
         self.assertEqual(b.stops[-1], "S1")
+
+    def test_closing_deadhead_cap(self):
+        # 끝 S1 → 기점 N1 공차 = 짧은 연결 하나(60~90초 프로필 최댓값 90초)
+        self.assertIsNotNone(LoopMaker(self.net, self.g, self.od, 1.6, None, 7020, close_max_s=90).build(
+            ("N1", "N2", "N3", "N4", "H")))
+        mk = LoopMaker(self.net, self.g, self.od, 1.6, None, 7020, close_max_s=89)
+        self.assertIsNone(mk.build(("N1", "N2", "N3", "N4", "H")))
+        self.assertEqual(mk.stats["failed_close"], 1)
+
+    def test_loop_total_detour(self):
+        stops = ("N1", "N2", "N3", "N4", "H", "E", "S4", "S3", "S2", "S1")
+        r = loop_detour(self.g, stops, 4, "loop_total")
+        self.assertAlmostEqual(r, self.g.length_m(stops) / (2 * self.net.stop_dist_m("N1", "H")))
+        self.assertEqual(loop_violations(self.g, stops, 4, r + 1e-6, None, 7020, detour_mode="loop_total"), [])
+        self.assertIn("detour", loop_violations(self.g, stops, 4, r - 1e-3, None, 7020, detour_mode="loop_total"))
 
     def test_return_detour_limit(self):
         stops = ("N1", "N2", "N3", "N4", "H", "E", "S4", "S3", "S2", "S1")
@@ -264,7 +279,9 @@ def _plan_bytes(net, demand, sc, p) -> bytes:
 
 class GenerateV2Test(unittest.TestCase):
     def params(self, **kw):
-        base = dict(c0_s=144000, radius_m=5000, length_n=2, max_stops=None, loops=True, home_gu="구로구")
+        # v2 프로필과 같은 순환 설정(순환만, 고리 전체 우회율, 닫는 공차 ≤ 300초, 짝 100m)
+        base = dict(c0_s=144000, radius_m=5000, length_n=2, max_stops=None, loops=True, loop_only=True,
+                    loop_detour="loop_total", close_max_s=300, pair_radius_m=100.0, home_gu="구로구")
         base.update(kw)
         return G.Params(**base)
 
@@ -273,7 +290,10 @@ class GenerateV2Test(unittest.TestCase):
         p = self.params(must_stops=("N3",))
         res = G.generate(net, dem, sc, p)
         shapes = {c.shape for c in res.candidates}
-        self.assertEqual(shapes, {"oneway", "loop"})
+        self.assertEqual(shapes, {"loop"})                                               # 편도 노선은 결과에 없다
+        self.assertGreater(res.loop_stats["oneway_seeds_not_allocated"], 0)
+        for lab, (pool, _) in G.pools(res.candidates, p.jaccard).items():
+            self.assertTrue(all(c.shape == "loop" for c in pool), lab)
         self.assertTrue(any("N3" in c.must for c in res.candidates))
         self.assertTrue(all(c.cycle_s <= (36000 - 21600) // 2 for c in res.candidates))   # 길이 규칙 N=2
         for c in res.candidates:                                                         # 변환기 통과
@@ -294,7 +314,7 @@ class GenerateV2Test(unittest.TestCase):
         res = G.generate(net, street_demand(), scenario(4), self.params(must_stops=("M",)))
         feeders = [c for c in res.candidates if c.origin == "must_feeder"]
         self.assertTrue(feeders)
-        self.assertTrue(all(c.stops[0] == "M" for c in feeders if c.shape == "oneway"))
+        self.assertTrue(all(c.shape == "loop" and c.stops[0] == "M" for c in feeders))
         self.assertGreater(max(c.detour for c in feeders), 1.6)
         self.assertTrue(all(c.detour <= 1.6 + 1e-9 for c in res.candidates if c.origin == "must_insert"))
 
@@ -304,6 +324,11 @@ class GenerateV2Test(unittest.TestCase):
         st = {"H", "E"}
         for c in res.candidates:
             self.assertTrue(set(G.terminals(c)) <= st, (c.stops, c.shape))
+
+    def test_mixed_shapes_only_without_loop_only(self):
+        net, dem, sc = street_network(), street_demand(), scenario(4)
+        res = G.generate(net, dem, sc, self.params(loop_only=False))
+        self.assertEqual({c.shape for c in res.candidates}, {"oneway", "loop"})
 
     def test_v1_defaults_make_no_loops(self):
         net, dem, sc = street_network(), street_demand(), scenario(4)

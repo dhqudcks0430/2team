@@ -16,8 +16,13 @@
 (`generate.covered_keys`)이 이미 그 조건이라 근사에서도 기점을 넘는 수요는 세지 않는다.
 
 제약(순회형)
-- 우회율은 방향마다: 가는 쪽(s_1 … 회차), 오는 쪽(회차 … 끝) 각각 ≤ max_detour.
-- 정차 상한(설정 시)도 방향마다.
+- 우회율(detour_mode)
+  - direction: 가는 쪽(s_1 … 회차), 오는 쪽(회차 … 끝) 각각 ≤ max_detour(오는 쪽은 return_detour로 따로 줄 수 있음).
+  - loop_total: 고리 전체 영업 길이 ÷ (2 × 기점–회차 직선) ≤ max_detour. 지자체 셔틀안의 고리는 대부분 같은 길로
+    되돌아오지 않고 다른 길로 한 바퀴 돈다(가는 쪽 중간 정류장 중 오는 쪽에 같은 이름이 있는 것 18%). 그래서 v2 기본.
+- 닫는 공차(close_max_s): 끝 → 기점 공차(망 최단경로, 06~09시 최댓값 가중치) ≤ 상한. 닫는 공차가 길면 사실상
+  편도(돌아오는 길에 손님을 안 태움)와 같아서 막는다. v2 기본 300초.
+- 정차 상한(설정 시)은 방향마다.
 - 길이: 영업 구간 시간(`Graph.oneway_s`) ≤ 길이 상한. 최종 주기 상한은 `generate._finish`가 시뮬레이터 주기로 본다.
 """
 
@@ -29,6 +34,7 @@ from .data import Network, haversine_m
 from .graph import Graph
 
 PAIR_RADIUS_M = 50.0
+DETOUR_MODES = ("direction", "loop_total")
 
 
 def opposite_pairs(net: Network, radius_m: float = PAIR_RADIUS_M) -> dict[str, str]:
@@ -80,9 +86,17 @@ class LoopBuild:
     deadhead_s: int                # 끝 → 첫 정류장 공차(망 최단경로, 06~09시 최댓값 가중치)
 
 
+def loop_detour(g: Graph, stops: tuple[str, ...], turn: int, mode: str = "direction") -> float:
+    """보고용 우회율. direction = 두 방향 중 큰 값, loop_total = 고리 길이 ÷ (2 × 기점–회차 직선)."""
+    if mode == "loop_total":
+        straight = g.net.stop_dist_m(stops[0], stops[turn])
+        return float("inf") if straight <= 0 else g.length_m(stops) / (2 * straight)
+    return max(g.detour(stops[:turn + 1]), g.detour(stops[turn:]))
+
+
 def loop_violations(g: Graph, stops: tuple[str, ...], turn: int, max_detour: float, max_stops: int | None,
-                    length_s: int, return_detour: float | None = None) -> list[str]:
-    """return_detour = 오는 쪽 우회율 상한(None = max_detour와 같음)."""
+                    length_s: int, return_detour: float | None = None, detour_mode: str = "direction") -> list[str]:
+    """return_detour = 오는 쪽 우회율 상한(None = max_detour와 같음, direction 방식에서만)."""
     bad = []
     if len(set(stops)) != len(stops):
         bad.append("repeat")
@@ -92,7 +106,10 @@ def loop_violations(g: Graph, stops: tuple[str, ...], turn: int, max_detour: flo
     if g.oneway_s(stops) > length_s:
         bad.append("length")
     fwd, back = stops[:turn + 1], stops[turn:]
-    if g.detour(fwd) > max_detour or g.detour(back) > (max_detour if return_detour is None else return_detour):
+    if detour_mode == "loop_total":
+        if loop_detour(g, stops, turn, "loop_total") > max_detour:
+            bad.append("detour")
+    elif g.detour(fwd) > max_detour or g.detour(back) > (max_detour if return_detour is None else return_detour):
         bad.append("detour")
     if max_stops is not None and (len(fwd) > max_stops or len(back) > max_stops):
         bad.append("max_stops")
@@ -102,7 +119,11 @@ def loop_violations(g: Graph, stops: tuple[str, ...], turn: int, max_detour: flo
 class LoopMaker:
     def __init__(self, net: Network, g: Graph, od_total: dict[tuple[str, str], float], max_detour: float,
                  max_stops: int | None, length_s: int, pair_radius_m: float = PAIR_RADIUS_M,
-                 insert_top: int = 30, return_detour: float | None = None):
+                 insert_top: int = 30, return_detour: float | None = None, detour_mode: str = "direction",
+                 close_max_s: int | None = None):
+        if detour_mode not in DETOUR_MODES:
+            raise ValueError(f"detour_mode는 {DETOUR_MODES} 중 하나다: {detour_mode}")
+        self.detour_mode, self.close_max_s = detour_mode, close_max_s
         self.net, self.g, self.od_total = net, g, od_total
         self.max_detour, self.max_stops, self.length_s = max_detour, max_stops, length_s
         self.return_detour = return_detour
@@ -110,7 +131,8 @@ class LoopMaker:
         self.pairs = opposite_pairs(net, pair_radius_m)
         self.a2e, self.e2a = station_partners(net)
         self.insert_top = insert_top
-        self.stats = {"built": 0, "failed": 0, "targets": 0, "paired": 0, "skipped": 0, "inserted": 0}
+        self.stats = {"built": 0, "failed": 0, "targets": 0, "paired": 0, "skipped": 0, "inserted": 0,
+                      "failed_close": 0}
 
     # ------------------------------------------------------------ 이어 붙이기
     def _extend(self, seq: list[str], targets: list[str]) -> tuple[list[str], list[str], int]:
@@ -145,7 +167,7 @@ class LoopMaker:
             return not loop_violations(self.g, stops, turn, float("inf"), self.max_stops, self.length_s,
                                        float("inf"))
         return not loop_violations(self.g, stops, turn, self.max_detour, self.max_stops, self.length_s,
-                                   self.return_detour)
+                                   self.return_detour, self.detour_mode)
 
     def _deadhead(self, a: str, b: str) -> int | None:
         if a == b:
@@ -242,6 +264,10 @@ class LoopMaker:
         if best is None:
             self.stats["failed"] += 1
             return None
+        if self.close_max_s is not None and best[0][0] > self.close_max_s:
+            self.stats["failed"] += 1
+            self.stats["failed_close"] += 1
+            return None                                # 닫는 공차가 길면 사실상 편도라 만들지 않는다
         j = best[1]
         stops = tuple(seq[: j + 1])
         if not self._ok(stops, turn):
